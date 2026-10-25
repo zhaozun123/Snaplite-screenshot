@@ -9,6 +9,13 @@ import sys, os, time, ctypes
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import snap
 
+# 控制台强制 UTF-8：CI runner 的默认 ANSI 码页是 cp1252，打印中文会 UnicodeEncodeError
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ok = True
 
 
