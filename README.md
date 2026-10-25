@@ -6,6 +6,19 @@
 ![python](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 ![platform](https://img.shields.io/badge/platform-Windows-lightgrey.svg)
 ![deps](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+[![release](https://img.shields.io/github/v/release/zhaozun123/Snaplite-screenshot?label=%E5%8F%91%E5%B8%83&color=blue)](https://github.com/zhaozun123/Snaplite-screenshot/releases/latest)
+
+---
+
+## 下载
+
+最新版本 **v1.1.0**（Windows 单文件绿色版，双击即用，无需安装 Python）：
+
+**[⬇ 下载 SnapLite.exe](https://github.com/zhaozun123/Snaplite-screenshot/releases/download/v1.1.0/SnapLite.exe)**
+
+> 首次运行会在 `%APPDATA%\SnapLite\` 生成配置文件。托盘图标右键可退出（关窗口只是隐藏到托盘）。
+
+全部版本见 [Releases](https://github.com/zhaozun123/Snaplite-screenshot/releases)。
 
 ---
 
