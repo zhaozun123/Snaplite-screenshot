@@ -1,3 +1,16 @@
+# PyInstaller 打包时排除的标准库模块清单
+#
+# SnapLite 只用到 Win32 API 和少量基础模块，这个清单里的东西全都用不上
+# （网络、数据库、并发、压缩、xml 等），排除后 exe 体积从 ~14MB 降到 ~5MB。
+#
+# 维护方式：
+#   1. 本文件是这份清单的源，SnapLite.spec 里的 excludes 字段与本文件保持一致
+#   2. 改动后重新打包：python -m PyInstaller SnapLite.spec --noconfirm --clean
+#   3. 若打包后 exe 启动报 ModuleNotFoundError，说明这里排除了实际需要的模块，
+#      把它从清单里删掉即可
+#
+# 格式：每行一个模块名，# 开头为注释
+
 ssl
 _ssl
 hashlib
@@ -78,3 +91,4 @@ zoneinfo
 graphlib
 _aix_support
 _compression
+

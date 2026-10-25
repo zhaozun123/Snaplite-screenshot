@@ -37,6 +37,15 @@
 
 ## 界面
 
+![SnapLite 截图标注界面](assets/screenshot.png)
+
+> 上图：全屏遮罩下框选区域，红色为画笔笔迹、蓝色为箭头，底部是浮动工具条。
+> 导出成品（复制到剪贴板 / 保存 PNG 的结果）：
+
+![导出成品](assets/result.png)
+
+### 结构示意
+
 ```
 ┌──────────────────────────────────────────────────────┐
 │  全屏半透明遮罩                                     │
@@ -108,12 +117,18 @@ snap.py              主程序（全部功能都在这一个文件里）
 SnapLite.spec        PyInstaller 打包配置
 make_ico.py          生成 app.ico（纯 BMP/AND 掩码，兼容各版本资源管理器）
 app.ico              程序图标
+assets/              README 用的界面截图（由脚本生成，勿手改）
 tests/
   test_pen.py        画笔链路自测（进入模式→绘制→落笔→撤销→渲染）
   test_pen_visual.py 像素级验证：画出来的线确实是标注色
 tools/
-  check_undefined.py 静态检查：抓出未定义名（NameError 风险）
-  audit_deadcode.py  静态检查：列出零引用的死代码
+  check_undefined.py    静态检查：抓出未定义名（NameError 风险）
+  audit_deadcode.py     静态检查：列出零引用的死代码
+  make_screenshot.py    离屏渲染 README 界面截图
+  excluded_modules.txt  打包时排除的标准库模块清单（对应 spec 里的 excludes）
+.github/
+  workflows/ci.yml   CI：静态检查 + 功能测试 + 打包
+  ISSUE_TEMPLATE/    Bug 反馈 / 功能建议模板
 ```
 
 ## 开发
@@ -123,6 +138,14 @@ python tools/check_undefined.py     # 未定义名检查
 python tools/audit_deadcode.py      # 死代码体检
 python tests/test_pen.py            # 功能自测
 python tests/test_pen_visual.py     # 像素级验证
+python tools/make_screenshot.py     # 重新生成 assets/ 里的截图
+```
+
+打包：
+
+```bash
+pip install pyinstaller==6.22.3
+python -m PyInstaller SnapLite.spec --noconfirm --clean
 ```
 
 代码风格：中文注释，函数名 / 变量名用英文；每个 Windows API 都在模块顶部

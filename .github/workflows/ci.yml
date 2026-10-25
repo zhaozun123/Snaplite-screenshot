@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  # ---------- 静态检查：跨平台，快速，必过 ----------
+  static:
+    name: 静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 语法编译检查
+        run: python -m py_compile snap.py
+
+      - name: 未定义名检查（symtable，精确）
+        run: python tools/check_undefined.py
+
+      - name: 死代码扫描（启发式，仅提示）
+        run: |
+          python tools/audit_deadcode.py | tee deadcode.txt
+          echo "--- 疑似死代码清单（人工确认，非阻断）---"
+          grep -c 'DEAD?' deadcode.txt || echo 0
+
+  # ---------- 功能测试：需要 Win32 GUI ----------
+  functional:
+    name: 功能测试（Windows）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 画笔链路测试
+        run: python tests/test_pen.py
+
+      - name: 画笔视觉验证（像素级）
+        run: python tests/test_pen_visual.py
+
+      - name: 生成界面截图（校验渲染管线可用）
+        run: |
+          python tools/make_screenshot.py
+          if (-not (Test-Path assets\screenshot.png)) {
+            Write-Error "截图生成失败"
+            exit 1
+          }
+          Write-Host "截图生成 OK"
+
+  # ---------- 打包：确保 exe 能构建出来 ----------
+  build:
+    name: 打包 exe
+    runs-on: windows-latest
+    needs: static
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 PyInstaller
+        run: pip install pyinstaller==6.22.3
+
+      - name: 构建
+        run: |
+          python -m PyInstaller SnapLite.spec --noconfirm --clean
+          if (-not (Test-Path dist\SnapLite.exe)) {
+            Write-Error "打包失败：未生成 exe"
+            exit 1
+          }
+          Write-Host ("exe 大小: " + (Get-Item dist\SnapLite.exe).Length + " bytes")
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SnapLite-win
+          path: dist/SnapLite.exe
+          retention-days: 7

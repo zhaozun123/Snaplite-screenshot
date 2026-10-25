@@ -1,0 +1,69 @@
+name: Bug 反馈
+description: 报告 SnapLite 出现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请先确认最新版本仍然存在此问题。
+
+  - type: textarea
+    id: version
+    attributes:
+      label: 版本
+      description: 使用的 SnapLite 版本（托盘图标右键 → 关于，或看发布页）
+      placeholder: v1.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: os
+    attributes:
+      label: 系统环境
+      description: Windows 版本与显示缩放
+      placeholder: |
+        - Windows: 11 23H2 (22631)
+        - 缩放: 150%
+        - 显卡驱动: NVIDIA xxx
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么
+      description: 描述你做了什么、期望什么、实际是什么
+      placeholder: 按 Ctrl+Alt+A 唤起后，工具条上的「画笔」按钮点不动
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 一步一步的操作流程
+      placeholder: |
+        1. 按 Ctrl+Alt+A 唤起
+        2. 拖拽框选区域
+        3. 点「画笔」
+        4. 按住左键画线 → 没有任何反应
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志
+      description: |
+        程序日志在 `%APPDATA%\SnapLite\` 目录下的 `.log` 文件里，
+        复现后请贴出相关内容（可脱敏）。
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我已确认使用的是最新版本
+        - label: 我已尝试重启程序（托盘图标右键 → 退出后重新运行）
