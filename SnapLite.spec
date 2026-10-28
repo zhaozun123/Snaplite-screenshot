@@ -14,6 +14,13 @@ a = Analysis(
     noarchive=False,
     optimize=2,
 )
+# 去掉与系统重复的 C 运行库副本：ucrtbase.dll + api-ms-win-crt-*.dll 共 38 个文件，
+# 压缩后占 0.92MB。Win10/11 的 System32 里一定有这些，直接用系统的即可
+# （README 声明的最低系统就是 Win10，不存在 UCRT 缺失的机器）。实测 5.37MB → 4.70MB。
+_DROP_DLL = ('ucrtbase.dll', 'api-ms-win-crt')
+a.binaries = [b for b in a.binaries
+              if not b[0].lower().startswith(_DROP_DLL)]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

@@ -175,17 +175,21 @@ def build_screenshot():
     # 4) 合成遮罩（真实逻辑）
     app._compose_overlay(W, H)
 
-    # 5) 离屏渲染工具条
+    # 5) 离屏渲染工具条（先在真实位置上取一块玻璃底，再画按钮）
     app._ensure_tool_surface()
     tw, th = app.tb_size
-    ctypes.memset(app.tb_bits, 0, tw * th * 4)
+    app.tb_pos = (150 + (620 - tw) // 2, 540)
+    glass = app._tool_glass_layer(tw, th, app.tb_pos)
+    if glass:
+        ctypes.memmove(app.tb_bits, glass, tw * th * 4)
+    else:
+        ctypes.memset(app.tb_bits, 0, tw * th * 4)
     g = GFX(app.tb_dc)
     app._draw_tool(g, tw, th)
     g.close()
     tool_raw = ctypes.string_at(app.tb_bits, tw * th * 4)
 
     # 6) 把工具条贴到合成图底部（模拟真实位置：选区下方居中）
-    app.tb_pos = (150 + (620 - tw) // 2, 540)
     tx, ty = app.tb_pos
     base = ctypes.string_at(bits_back, W * H * 4)
     buf = bytearray(base)

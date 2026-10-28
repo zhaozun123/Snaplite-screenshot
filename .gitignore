@@ -18,6 +18,12 @@ dist/
 snap_error.log
 snap_debug.log
 
+# 调试/验证脚本生成的临时图片（只保留 README 用到的 result.png、screenshot.png）
+assets/preview.png
+assets/drag_frames.png
+assets/drag_realtime.png
+assets/tool_glass.png
+
 # 编辑器 / IDE
 .vscode/
 .idea/
@@ -25,3 +31,4 @@ snap_debug.log
 *.swo
 .DS_Store
 Thumbs.db
+assets/_dbg_*.png

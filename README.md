@@ -12,11 +12,14 @@
 
 ## 下载
 
-最新版本 **v1.1.0**（Windows 单文件绿色版，双击即用，无需安装 Python）：
+最新版本 **v1.2.0**（Windows 单文件绿色版，约 4.7 MB，双击即用，无需安装 Python）：
 
-**[⬇ 下载 SnapLite.exe](https://github.com/zhaozun123/Snaplite-screenshot/releases/download/v1.1.0/SnapLite.exe)**
+**[⬇ 下载 SnapLite.exe](https://github.com/zhaozun123/Snaplite-screenshot/releases/download/v1.2.0/SnapLite.exe)**
 
 > 首次运行会在 `%APPDATA%\SnapLite\` 生成配置文件。托盘图标右键可退出（关窗口只是隐藏到托盘）。
+
+**v1.2.0 更新**：界面改为苹果液态玻璃风（主面板 + 悬浮工具条毛玻璃）；拖动主面板时背景模糊逐像素实时刷新；
+修复截图时主界面不随遮罩一起压暗、点工具后主界面消失、工具条切换画笔/马赛克/箭头时选项排残留错乱等问题。
 
 全部版本见 [Releases](https://github.com/zhaozun123/Snaplite-screenshot/releases)。
 
@@ -105,7 +108,8 @@ python -m PyInstaller SnapLite.spec --noconfirm --clean
 ```
 
 产物在 `dist/SnapLite.exe`。`SnapLite.spec` 里已经排除了用不到的模块
-（`ssl` / `urllib` / `tkinter` / `asyncio` …），成品约 5 MB。
+（`ssl` / `urllib` / `tkinter` / `asyncio` …），并且不打包系统自带的 C 运行库副本
+（`ucrtbase.dll` / `api-ms-win-crt-*`，Win10/11 的 System32 里都有），成品约 4.7 MB。
 
 > 想瘦身可以再精简 `SnapLite.spec` 的 `excludes` 列表，但注意保留
 > `ctypes` / `struct` / `threading` / `winreg` 相关依赖。

@@ -18,7 +18,7 @@ import threading
 import time
 import traceback
 import winreg
-from math import hypot, radians, cos, sin
+from math import hypot, radians, cos, sin, floor, ceil
 from ctypes import (windll, byref, sizeof, POINTER, WINFUNCTYPE, Structure,
                     c_int, c_uint, c_long, c_ulong, c_ushort, c_ulonglong,
                     c_void_p, c_float, c_ubyte, c_short, c_wchar)
@@ -34,6 +34,11 @@ shell32 = windll.shell32
 ole32 = windll.ole32
 oleacc = windll.oleacc
 dwmapi = windll.dwmapi
+# AlphaBlend 只有它一个函数用得上；拿不到就退化成 BitBlt（见 _blend_main_into_shot）
+try:
+    msimg32 = windll.msimg32
+except OSError:
+    msimg32 = None
 
 P = c_void_p
 LRESULT = ctypes.c_ssize_t
@@ -44,7 +49,7 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "SnapLite"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_TITLE = "%s %s" % (APP_NAME, APP_VERSION)
 
 DEBUG = bool(os.environ.get("SNAPLITE_DEBUG"))
@@ -132,8 +137,8 @@ HOTKEY_ID = 0xA1
 WM_PAINT = 0x000F
 WM_ERASEBKGND = 0x0014
 WM_DESTROY = 0x0002
-WM_CLOSE = 0x0010
 WM_NULL = 0x0000
+WM_MOVE = 0x0003
 WM_MOUSEMOVE = 0x0200
 WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
@@ -146,28 +151,22 @@ WM_ACTIVATE = 0x0006
 WM_SETCURSOR = 0x0020
 WM_MOUSELEAVE = 0x02A3
 WM_HOTKEY = 0x0312
+WM_CAPTURECHANGED = 0x0215
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
 
 WS_POPUP = 0x80000000
-WS_VISIBLE = 0x10000000
-WS_CHILD = 0x40000000
 WS_EX_TOPMOST = 0x00000008
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_LAYERED = 0x00080000
 WS_EX_NOACTIVATE = 0x08000000
-WS_EX_TRANSPARENT = 0x00000020
-LWA_COLORKEY = 0x00000001
-LWA_ALPHA = 0x00000002
 SWP_NOACTIVATE = 0x0010
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
-SWP_NOOWNERZORDER = 0x0200
 HWND_TOPMOST = -1
 
 SW_HIDE = 0
 SW_SHOW = 5
-SW_SHOWNOACTIVATE = 4
 SW_SHOWNA = 8
 
 SRCCOPY = 0x00CC0020
@@ -176,7 +175,6 @@ DIB_RGB_COLORS = 0
 GW_HWNDNEXT = 2
 
 VK_ESCAPE = 0x1B
-VK_RETURN = 0x0D
 VK_CONTROL, VK_MENU, VK_SHIFT = 0x11, 0x12, 0x10
 VK_LWIN, VK_RWIN = 0x5B, 0x5C
 MODIFIER_VKS = {0x10, 0x11, 0x12, 0x5B, 0x5C,
@@ -348,6 +346,7 @@ SetProcessDpiAwarenessContext = _lazy_proto(
     user32, "SetProcessDpiAwarenessContext", [c_void_p], w.BOOL)
 _proto(user32.SetProcessDPIAware, [], w.BOOL)
 _proto(user32.GetCursorPos, [POINTER(w.POINT)], w.BOOL)
+_proto(user32.SetCapture, [w.HWND], w.HWND)
 _proto(user32.WindowFromPoint, [w.POINT], w.HWND)
 _proto(user32.SetWindowRgn, [w.HWND, w.HANDLE, w.BOOL], c_int)
 _proto(user32.SetLayeredWindowAttributes, [w.HWND, w.DWORD, c_ubyte, w.DWORD], w.BOOL)
@@ -386,6 +385,12 @@ _proto(gdi32.CombineRgn, [w.HANDLE, w.HANDLE, w.HANDLE, c_int], c_int)
 _proto(gdi32.CreateDIBSection, [w.HDC, POINTER(BITMAPINFO), c_uint, POINTER(c_void_p),
                                 w.HANDLE, w.DWORD], w.HANDLE)
 
+if msimg32:
+    # 源位图是预乘 alpha（和 UpdateLayeredWindow 同一套语义），所以直接用
+    # AC_SRC_ALPHA 就能得到和屏幕上一模一样的合成结果。
+    _proto(msimg32.AlphaBlend, [w.HDC, c_int, c_int, c_int, c_int,
+                                w.HDC, c_int, c_int, c_int, c_int, BLENDFUNCTION], w.BOOL)
+
 _proto(gdip.GdiplusStartup, [POINTER(P), POINTER(GdiplusStartupInput), c_void_p])
 _proto(gdip.GdipCreateFromHDC, [w.HDC, POINTER(P)])
 _proto(gdip.GdipCreateBitmapFromScan0, [c_int, c_int, c_int, c_int, c_void_p, POINTER(P)])
@@ -395,6 +400,7 @@ _proto(gdip.GdipSetSmoothingMode, [P, c_int])
 _proto(gdip.GdipSetTextRenderingHint, [P, c_int])
 _proto(gdip.GdipSetPixelOffsetMode, [P, c_int])
 _proto(gdip.GdipSetInterpolationMode, [P, c_int])
+_proto(gdip.GdipDrawImageRectI, [P, P, c_int, c_int, c_int, c_int])
 _proto(gdip.GdipCreateSolidFill, [c_uint, POINTER(P)])
 _proto(gdip.GdipFillRectangle, [P, P, c_float, c_float, c_float, c_float])
 _proto(gdip.GdipDeleteBrush, [P])
@@ -450,6 +456,13 @@ _proto(gdi32.SaveDC, [w.HDC], c_int)
 _proto(gdi32.RestoreDC, [w.HDC, c_int], w.BOOL)
 _proto(gdi32.IntersectClipRect, [w.HDC, c_int, c_int, c_int, c_int], c_int)
 _proto(gdi32.SelectClipRgn, [w.HDC, w.HANDLE], c_int)
+# 直接从屏幕 DC 缩到小图：一步完成，比「先 BitBlt 整屏再 GDI+ 缩小」快一倍
+_proto(gdi32.StretchBlt, [w.HDC, c_int, c_int, c_int, c_int,
+                          w.HDC, c_int, c_int, c_int, c_int, w.DWORD], w.BOOL)
+_proto(gdi32.SetStretchBltMode, [w.HDC, c_int], c_int)
+
+# 等 DWM 把当前帧真正合成到屏幕（抓背景前要确保自己的窗口已经“消失”）
+_proto(dwmapi.DwmFlush, [], c_long)
 
 _proto(windll.kernel32.GlobalAlloc, [c_uint, ctypes.c_size_t], c_void_p)
 _proto(windll.kernel32.GlobalLock, [c_void_p], c_void_p)
@@ -458,25 +471,23 @@ _proto(windll.kernel32.GetModuleHandleW, [w.LPCWSTR], w.HINSTANCE)
 
 
 # ============================================================ 配色
-C_BG = 0xFF17191E
-C_TAG_BG = 0xFF23272F
-C_TITLE = 0xFFF2F4F7
-C_SUB = 0xFF7F8896
-C_HINT = 0xFF6B7383
-C_ACCENT = 0xFF3B82F6
-C_ACCENT_HI = 0xFF4B90FA
-C_HOVER_SOFT = 0xFF2A2E36
-C_CLOSE_HOT = 0xFF6E2A33
-C_TOOL_BG = 0xFF1E2127
-C_TOOL_TXT = 0xFFC9D0DB
-C_TOOL_HOVER = 0xFF2C313A
+C_TAG_BG = 0x24FFFFFF          # 玻璃上的“胶囊”：半透明白，不再是一块实心灰
+C_TITLE = 0xFFF5F7FA
+C_SUB = 0xFFB7C0CE
+C_HINT = 0xFF97A1B1
+C_ACCENT = 0xFF0A84FF          # iOS 系统蓝
+C_ACCENT_HI = 0xFF3D9BFF
+C_HOVER_SOFT = 0x2EFFFFFF
 
-# 独立按钮组（截图后的浮动工具条）—— 除「复制」图标保留蓝色外，整排统一中性色
-C_TB_BTN = 0xFF1F232A
-C_TB_BTN_HI = 0xFF313944
+# 独立按钮组（截图后的浮动工具条）—— 版式保持 v1.1.0：每个按钮各自一块，之间留缝。
+# 底色改成半透明：底下垫的是「该位置的桌面模糊图」（_tool_glass_layer），
+# 于是按钮看起来是磨砂玻璃而不是一块实心灰。alpha 60% 时压暗程度与原来的
+# 实心 #1F232A 几乎一致，只是背后能看见被模糊掉的桌面轮廓。
+C_TB_BTN = 0x991D2229
+C_TB_BTN_HI = 0xCC363E49
 C_TB_COPY = C_TB_BTN                 # 跟同一排按钮完全一致，避免看起来"透明度不一样"
 C_TB_COPY_HI = C_TB_BTN_HI
-C_TB_CANCEL_HI = 0xFF5A2A33          # 取消：悬停时才泛红，静止态和其他按钮一致
+C_TB_CANCEL_HI = 0xCC5A2A33          # 取消：悬停时才泛红，静止态和其他按钮一致
 C_TB_TXT = 0xFFD3DAE5
 C_TB_ICO = 0xFF97A2B1
 C_TB_COPY_TXT = C_TB_TXT
@@ -487,14 +498,12 @@ TB_ALPHA = 242          # 整组半透明（0-255），略透出背后内容
 TB_ITEMS = (("reselect", "重选"), ("pen", "画笔"), ("mosaic", "马赛克"),
             ("arrow", "箭头"), ("undo", "撤销"), ("copy", "复制"),
             ("save", "保存"), ("cancel", "取消"))
-RGN_OR = 2
 C_WHITE = 0xFFFFFFFF
 C_WARN = 0xFFF08A8A
 
 # 标注颜色（ARGB）：红 蓝 绿 黄 白 黑 灰
 ANNO_COLORS = (0xFFFF3B30, 0xFF0A84FF, 0xFF34C759, 0xFFFFD60A,
                0xFFFFFFFF, 0xFF101014, 0xFF8E8E93)
-ANNO_COLOR_NAMES = ("红", "蓝", "绿", "黄", "白", "黑", "灰")
 
 # 马赛克：笔头半径 / 块大小（三档，随时可切）
 MOSAIC_BRUSHES = (12, 20, 32)
@@ -754,6 +763,35 @@ class GFX:
 
 
 # ============================================================ 屏幕抓取
+def _new_dib(sdc, ww, hh):
+    """建一块 32bpp top-down DIB，返回 (dc, bmp, old, bits)"""
+    bi = BITMAPINFO()
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER)
+    bi.bmiHeader.biWidth = ww
+    bi.bmiHeader.biHeight = -hh
+    bi.bmiHeader.biPlanes = 1
+    bi.bmiHeader.biBitCount = 32
+    bi.bmiHeader.biCompression = 0
+    bits = c_void_p()
+    bmp = gdi32.CreateDIBSection(sdc, byref(bi), DIB_RGB_COLORS, byref(bits), None, 0)
+    dc = gdi32.CreateCompatibleDC(sdc)
+    old = gdi32.SelectObject(dc, bmp)
+    return dc, bmp, old, bits
+
+
+def _free_dib(d):
+    dc, bmp, old, bits = d
+    try:
+        if dc and old:
+            gdi32.SelectObject(dc, old)
+        if dc:
+            gdi32.DeleteDC(dc)
+        if bmp:
+            gdi32.DeleteObject(bmp)
+    except Exception:
+        pass
+
+
 def grab_screen(x, y, ww, hh):
     """返回 (buffer, w, h)，32bpp top-down，BGRA"""
     hdc = user32.GetDC(None)
@@ -941,7 +979,7 @@ class App:
         # 主面板尺寸
         self.MW = self.px(340)
         self.MH = self.px(148)
-        self.RADIUS = self.px(14)
+        self.RADIUS = self.px(20)
 
         self.hwnd_main = None
         self.hwnd_overlay = None
@@ -1002,6 +1040,7 @@ class App:
         self.dc_shot = self.dc_dim = self.dc_back = None
         self.bmp_shot = self.bmp_dim = self.bmp_back = None
         self.hdc_screen = None
+        self._sdc = None               # 常驻的屏幕 DC（见 _get_screen_dc）
         self._mos_cache = {}           # 马赛克块的平均色缓存（每次截图重置）
 
         # 交互 hover 状态
@@ -1013,10 +1052,44 @@ class App:
         # 工具条逐像素呈现表面
         self.tb_dc = self.tb_bmp = self.tb_old = self.tb_bits = None
         self.tb_size = None
+        self.tb_key = None             # 布局签名（模式一换就变，见 _tool_layout_key）
         self.tb_mask = self.tb_edge = None
         self.tb_scale = None
         self.tb_alpha = None
         self.tb_pos = (0, 0)
+        # 毛玻璃底：缓存「该位置的桌面模糊图 + 按钮形状覆盖率」
+        self.tb_glass = None           # 玻璃底 bytes（W×H×4）
+        self.tb_glass_key = None       # (x, y, W, H, sel) —— 位置/尺寸/选区变了才重算
+        self.tb_cov = None             # 按钮形状覆盖率（只跟版式有关）
+        self.tb_cov_key = None
+        # True：玻璃底取「原图」（磨砂看得出来，跟主界面一致）；
+        # False：取遮罩里压暗后的画面（几乎看不出磨砂）。见 tools/preview_tool_glass.py
+        self.use_shot_glass = True
+
+        # 主窗口逐像素呈现表面（液态玻璃）
+        self.mn_dc = self.mn_bmp = self.mn_old = self.mn_bits = None
+        self.mn_size = None
+        # 截图瞬间主窗口那一帧的拷贝 + 窗口在屏幕上的位置：
+        # 抓屏前主窗口要提交全透明帧（不然会抓到自己），那块像素就没了，
+        # 靠这两样在遮罩里把“桌面上的主界面”还原出来。
+        self.mn_keep = None
+        self.mn_keep_size = None
+        self.main_rect = None
+        self.mn_glass = None           # 模糊后的桌面底（BGRA 原始字节）
+        self.mn_cov = None             # 圆角覆盖率缓存
+        self.mn_cov_key = None
+        # 拖动中的玻璃底来源：一张全屏缩略图。
+        # 拖窗时每帧都去抓屏是不行的（抓屏前必须先把自己变透明 → 会闪），
+        # 所以改成「拖动开始时抓一整屏、缩到 1/13 存着，之后按新位置从里面裁」。
+        self.drag_small = None         # bytes：全屏缩略图
+        self.drag_small_size = None    # (sw, sh)
+        self.drag_scale = (1.0, 1.0)   # 屏幕像素 / 缩略图像素
+        self.drag_active = False
+        self.drag_last_pos = None      # 上次提交时的窗口位置（位置没变就不重画）
+
+        # 自己接管的窗口拖动（不走系统拖动循环，位置和背景才能同帧提交）
+        self.main_drag = False
+        self.main_drag_off = (0, 0)    # 按下时鼠标相对窗口左上角的偏移
 
         # 窗口过程统一兜一层异常：ctypes 回调里抛出的异常会被 ctypes 静默吞掉
         # （只在 stderr 打一行 "Exception ignored"），用户和开发者都看不到现场，
@@ -1275,17 +1348,15 @@ class App:
         x = (sw - self.MW) // 2
         y = max(0, (sh - self.MH) // 2 - self.px(60))
         self.hwnd_main = user32.CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST, "SnapLiteMain", APP_NAME, WS_POPUP | WS_VISIBLE,
-            x, y, self.MW, self.MH, None, None, self.hinst, None)
-        self._round_window(self.hwnd_main, self.MW, self.MH, self.RADIUS)
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, "SnapLiteMain", APP_NAME,
+            WS_POPUP, x, y, self.MW, self.MH, None, None, self.hinst, None)
+        if not self.hwnd_main:
+            return
+        # 先把背后的真实桌面抓下来做成玻璃底，再上屏 —— 避免先黑一下再变玻璃
+        self._refresh_glass(blank=False)
         user32.ShowWindow(self.hwnd_main, SW_SHOW)
-        user32.UpdateWindow(self.hwnd_main)
         dbg("create_main hwnd=%s visible=%s" % (self.hwnd_main,
                                                 user32.IsWindowVisible(self.hwnd_main)))
-
-    def _round_window(self, hwnd, ww, hh, r):
-        rgn = gdi32.CreateRoundRectRgn(0, 0, ww + 1, hh + 1, r * 2, r * 2)
-        user32.SetWindowRgn(hwnd, rgn, True)
 
     def _main_layout(self):
         W, H = self.MW, self.MH
@@ -1299,29 +1370,536 @@ class App:
         hot = (self.px(18), self.px(100), W - self.px(36), self.px(30))
         return close, hide, btn, hot
 
+    # ---------- 液态玻璃：主窗口用逐像素 alpha 分层表面
     def _paint_main(self, hwnd):
         ps = PAINTSTRUCT()
-        hdc = user32.BeginPaint(hwnd, byref(ps))
-        rc = w.RECT()
-        user32.GetClientRect(hwnd, byref(rc))
-        W, H = rc.right, rc.bottom
-
-        mem = gdi32.CreateCompatibleDC(hdc)
-        bmp = gdi32.CreateCompatibleBitmap(hdc, W, H)
-        old = gdi32.SelectObject(mem, bmp)
-        g = GFX(mem)
-        self._draw_main(g, W, H)
-        g.close()
-
-        gdi32.BitBlt(hdc, 0, 0, W, H, mem, 0, 0, SRCCOPY)
-        gdi32.SelectObject(mem, old)
-        gdi32.DeleteObject(bmp)
-        gdi32.DeleteDC(mem)
+        user32.BeginPaint(hwnd, byref(ps))
         user32.EndPaint(hwnd, byref(ps))
+        if self.capturing:
+            # 截图期间主窗口必须停在全透明那一帧：这里一旦画回来，真窗口就会
+            # 重新出现在遮罩里（透明副本 + 真窗口叠在一起，边缘和模糊全对不上）
+            return
+        self._present_main()
+
+    def _get_screen_dc(self):
+        """屏幕 DC：惰性创建一次，之后一直复用。
+
+        原来各处写的是 `self.hdc_screen or user32.GetDC(None)` —— 截图之前
+        hdc_screen 还是 None，于是每画一帧就 GetDC 一次却从不 ReleaseDC，
+        拖动几十秒就能把进程的 GDI 句柄耗光。"""
+        if self.hdc_screen:
+            return self.hdc_screen
+        if not self._sdc:
+            self._sdc = user32.GetDC(None)
+        return self._sdc
+
+    def _release_screen_dc(self):
+        if self._sdc:
+            try:
+                user32.ReleaseDC(None, self._sdc)
+            except Exception:
+                pass
+            self._sdc = None
+
+    def _ensure_main_surface(self):
+        W, H = self.MW, self.MH
+        if self.mn_dc and self.mn_size == (W, H):
+            return
+        self._release_main_surface()
+        sdc = self._get_screen_dc()
+        self.mn_dc, self.mn_bmp, self.mn_old, self.mn_bits = _new_dib(sdc, W, H)
+        self.mn_size = (W, H)
+
+    def _release_main_surface(self):
+        if self.mn_dc:
+            _free_dib((self.mn_dc, self.mn_bmp, self.mn_old, self.mn_bits))
+            self.mn_dc = None
+        self.mn_bmp = self.mn_old = self.mn_bits = None
+        self.mn_size = None
+        if self.mn_keep:
+            _free_dib(self.mn_keep)
+            self.mn_keep = None
+        self.mn_keep_size = None
+
+    def _blit_main(self, dst=None):
+        """提交一帧。
+
+        dst 传 None：只换内容，绝不动窗口位置。
+        dst 传 POINT：**位置和内容在同一次提交里一起给系统** —— 拖动时用这个，
+        DWM 会在同一个合成帧里同时移动窗口和换掉背景，两者不会错开一帧。
+
+        注意 pptDst 一旦传值就意味着「把窗口搬到该坐标」，所以平时重绘必须
+        传 None。上一版就是在这里固定传了 POINT(0,0)，才让窗口每次重绘都跑到
+        屏幕左上角。"""
+        if not (self.hwnd_main and self.mn_dc):
+            return
+        W, H = self.mn_size
+        size = w.SIZE(W, H)
+        pt_src = w.POINT(0, 0)
+        bf = BLENDFUNCTION(0, 0, 255, 1)      # AC_SRC_OVER + AC_SRC_ALPHA
+        sdc = self._get_screen_dc()
+        user32.UpdateLayeredWindow(self.hwnd_main, sdc,
+                                   byref(dst) if dst is not None else None,
+                                   byref(size),
+                                   self.mn_dc, byref(pt_src), 0, byref(bf), 2)
+
+    def _present_blank(self):
+        """提交一帧全透明：让 DWM 先把窗口从屏幕上抹掉，这样紧接着的 BitBlt
+        抓到的是桌面本身，而不是我们自己的窗口（否则会抓到自己 → 套娃）"""
+        if not self.hwnd_main:
+            return
+        self._ensure_main_surface()
+        W, H = self.mn_size
+        ctypes.memset(self.mn_bits, 0, W * H * 4)
+        self._blit_main()
+
+    def _present_main(self, dst=None):
+        if not self.hwnd_main:
+            return
+        self._ensure_main_surface()
+        W, H = self.mn_size
+        total = W * H * 4
+        ctypes.memset(self.mn_bits, 0, total)
+        g = GFX(self.mn_dc)
+        try:
+            glass = self.mn_glass
+            if glass and len(glass) == total:
+                ctypes.memmove(self.mn_bits, glass, total)
+            else:
+                # 抓不到桌面时退化成实底，保证文字一定可读
+                g.fill_round(0xFF14161A, 0, 0, W, H, self.RADIUS)
+            self._draw_main(g, W, H)
+        finally:
+            g.close()
+        self._apply_round_mask(W, H)
+        self._blit_main(dst)
+
+    # ---------- 截图时把主窗口“画回”桌面
+    def _keep_main_surface(self):
+        """把主窗口当前这一帧拷一份留底。
+
+        _present_blank() 会把 mn_bits 清零（否则抓屏会抓到自己），所以这份
+        拷贝是遮罩里还原主界面的唯一来源。"""
+        if not (self.mn_dc and self.mn_bits):
+            self.mn_keep = None
+            return
+        W, H = self.mn_size
+        if not (self.mn_keep and self.mn_keep_size == (W, H)):
+            if self.mn_keep:
+                _free_dib(self.mn_keep)
+                self.mn_keep = None
+            dib = _new_dib(self._get_screen_dc(), W, H)
+            if not (dib[0] and dib[3]):
+                _free_dib(dib)                # GDI 句柄耗尽 → 不补了，遮罩那块留桌面
+                self.mn_keep_size = None
+                return
+            self.mn_keep = dib
+            self.mn_keep_size = (W, H)
+        ctypes.memmove(self.mn_keep[3], self.mn_bits, W * H * 4)
+
+    def _blend_main_into_shot(self):
+        """把留底的主窗口像素合进 dc_shot。
+
+        抓屏时主窗口是全透明的，所以 dc_shot 那块本来是「桌面本身」。不补回来，
+        遮罩一盖上去那块就变回桌面 —— 看起来就是主界面“消失”。补进去之后它
+        就是桌面上一个普通窗口：没框到时跟着压暗变灰，框到时随选区一起变亮，
+        跟眼睛看到的一致。"""
+        if not (self.main_rect and self.mn_keep and self.dc_shot):
+            return
+        if not (self.mn_keep[0] and self.mn_keep[3]):
+            return
+        mx, my, mw, mh = self.main_rect
+        vsx, vsy, vsw, vsh = self.vs
+        x0, y0 = max(mx, vsx), max(my, vsy)
+        x1, y1 = min(mx + mw, vsx + vsw), min(my + mh, vsy + vsh)
+        if x1 <= x0 or y1 <= y0:
+            return                        # 窗口完全在虚拟屏外（多屏拔掉等情况）
+        ww, hh = x1 - x0, y1 - y0
+        dx, dy = x0 - vsx, y0 - vsy       # dc_shot 内的落点
+        sx, sy = x0 - mx, y0 - my         # mn_keep 内的取点
+        ok = 0
+        if msimg32:
+            bf = BLENDFUNCTION(0, 0, 255, 1)      # AC_SRC_OVER + AC_SRC_ALPHA
+            ok = msimg32.AlphaBlend(self.dc_shot, dx, dy, ww, hh,
+                                    self.mn_keep[0], sx, sy, ww, hh, bf)
+        if not ok:
+            # AlphaBlend 不可用（极老的系统 / 句柄耗尽）→ 直接贴，至少不是空洞；
+            # 代价只是圆角边缘多出一圈黑点，肉眼几乎看不出
+            gdi32.BitBlt(self.dc_shot, dx, dy, ww, hh, self.mn_keep[0], sx, sy, SRCCOPY)
+
+    def _refresh_glass(self, blank=True):
+        """抓主窗口背后的真实桌面 → 模糊 → 当玻璃底。"""
+        if not self.hwnd_main:
+            return
+        W, H = self.MW, self.MH
+        if blank:
+            self._present_blank()
+            try:
+                dwmapi.DwmFlush()          # 等这一帧真的合成到屏幕上
+            except Exception:
+                pass
+        rc = w.RECT()
+        user32.GetWindowRect(self.hwnd_main, byref(rc))
+        raw = None
+        try:
+            raw = grab_screen(rc.left, rc.top, W, H).raw
+        except Exception as e:
+            dbg("glass grab failed: %r" % (e,))
+        if raw and len(raw) == W * H * 4:
+            try:
+                self.mn_glass = self._blur_bgra(raw, W, H)
+            except Exception as e:
+                dbg("glass blur failed: %r" % (e,))
+                self.mn_glass = None
+        else:
+            self.mn_glass = None
+        self._present_main()
+
+    def _blur_bgra(self, raw, W, H):
+        """缩到 1/f 再用 GDI+ 双三次插值放回来 → 平滑模糊（零第三方依赖）
+
+        注意：不能用 GDI 的 StretchBlt + HALFTONE，32bpp 目标下会退化成
+        最近邻，放大会出现明显马赛克方块。"""
+        sdc = self._get_screen_dc()
+        f = 13
+        sw, sh = max(2, W // f), max(2, H // f)
+        made = []
+        imgs = []
+        try:
+            src = _new_dib(sdc, W, H)
+            made.append(src)
+            ctypes.memmove(src[3], raw, W * H * 4)
+
+            small = _new_dib(sdc, sw, sh)
+            made.append(small)
+            g1 = GFX(small[0])
+            img = P()
+            gdip.GdipCreateBitmapFromScan0(W, H, W * 4, 0x00022009, src[3], byref(img))
+            imgs.append(img)
+            gdip.GdipDrawImageRectI(g1.g, img, 0, 0, sw, sh)
+            g1.close()
+
+            raw_small = ctypes.string_at(small[3], sw * sh * 4)
+            out = _new_dib(sdc, W, H)
+            made.append(out)
+            g2 = GFX(out[0])
+            img2 = P()
+            # 注意：GdipCreateBitmapFromScan0 不拷贝像素，只接管指针。
+            # 这里必须用变量持有这块缓冲，否则它被回收后 GDI+ 仍然去读 → 随机崩溃。
+            hold = ctypes.create_string_buffer(raw_small, len(raw_small))
+            gdip.GdipCreateBitmapFromScan0(sw, sh, sw * 4, 0x00022009,
+                                           hold, byref(img2))
+            imgs.append(img2)
+            gdip.GdipDrawImageRectI(g2.g, img2, 0, 0, W, H)
+            g2.close()
+            data = bytearray(ctypes.string_at(out[3], W * H * 4))
+        finally:
+            for im in imgs:
+                try:
+                    gdip.GdipDisposeImage(im)
+                except Exception:
+                    pass
+            for d in reversed(made):
+                _free_dib(d)
+        data[3::4] = b"\xff" * (W * H)     # 玻璃底完全不透明（压暗在绘制时叠）
+        return bytes(data)
+
+    # ---------- 拖动中的实时玻璃：全屏缩略图 + 按位置裁剪
+    BLUR_F = 13          # 模糊强度：缩到 1/13 再放回来
+
+    def _begin_drag_glass(self):
+        """开始拖动：趁窗口还在原位，抓一整屏桌面存成缩略图。
+
+        之后拖动过程中不再抓屏，只从这张缩略图里裁 —— 既跟手，又不会闪。
+
+        这里不再「先提交一帧全透明再等 DWM 合成」：那一趟要 40~50ms，全花在
+        按下的瞬间，手上一按就发粘。现在直接抓，抓到的画面里会带上我们自己
+        的窗口，抓完用 _patch_own_window 把那块补掉。"""
+        if not self.hwnd_main or self.drag_active:
+            return
+
+        # 重新读一次虚拟屏幕：拖动中插拔显示器的情况也要照顾到
+        self.vs = (user32.GetSystemMetrics(SM_XVIRTUALSCREEN),
+                   user32.GetSystemMetrics(SM_YVIRTUALSCREEN),
+                   user32.GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                   user32.GetSystemMetrics(SM_CYVIRTUALSCREEN))
+        vx, vy, vw, vh = self.vs
+        if vw < 16 or vh < 16:
+            self._present_main()
+            return
+
+        f = self.BLUR_F
+        sw, sh = max(2, vw // f), max(2, vh // f)
+        small = None
+        try:
+            d = _new_dib(self._get_screen_dc(), sw, sh)
+            try:
+                gdi32.SetStretchBltMode(d[0], 4)       # HALFTONE：缩小要平均采样
+                ok = gdi32.StretchBlt(d[0], 0, 0, sw, sh,
+                                      self._get_screen_dc(), vx, vy, vw, vh, SRCCOPY)
+                if ok:
+                    small = ctypes.string_at(d[3], sw * sh * 4)
+            finally:
+                _free_dib(d)
+        except Exception as e:
+            dbg("drag glass grab failed: %r" % (e,))
+        if not small or len(small) != sw * sh * 4:
+            self._end_drag_glass()
+            self._present_main()
+            return
+
+        small = self._patch_own_window(small, sw, sh, vx, vy, vw, vh)
+        self.drag_small = small
+        self.drag_small_size = (sw, sh)
+        self.drag_scale = (vw / float(sw), vh / float(sh))
+        self.drag_active = True
+        self.drag_last_pos = None
+        self._present_main()
+
+    def _patch_own_window(self, small, sw, sh, vx, vy, vw, vh):
+        """把缩略图里「我们自己窗口」占的那块补掉。
+
+        抓屏时窗口还在原位，不先把它藏起来（那一趟要 40ms 且会闪），抓到的
+        画面里就带着自己；等窗口被拖走、原位置重新露出来时，那块背景会变成
+        自己的残影。缩略图只有 200×110 左右，窗口占的那一小块用该行左右两侧
+        的外部像素做水平插值补上，放大模糊后看不出接缝。"""
+        try:
+            rc = w.RECT()
+            user32.GetWindowRect(self.hwnd_main, byref(rc))
+            kx = vw / float(sw)
+            ky = vh / float(sh)
+            x0 = max(0, min(sw, int(round((rc.left - vx) / kx))))
+            x1 = max(0, min(sw, int(round((rc.right - vx) / kx))))
+            y0 = max(0, min(sh, int(round((rc.top - vy) / ky))))
+            y1 = max(0, min(sh, int(round((rc.bottom - vy) / ky))))
+            if x1 - x0 < 1 or y1 - y0 < 1:
+                return small
+
+            buf = bytearray(small)
+            span = float(x1 - x0)
+            for y in range(y0, y1):
+                lx = x0 - 1 if x0 > 0 else min(sw - 1, x1)
+                rx = x1 if x1 < sw else lx
+                lo = (y * sw + lx) * 4
+                hi = (y * sw + rx) * 4
+                b0, g0, r0 = buf[lo], buf[lo + 1], buf[lo + 2]
+                b1, g1, r1 = buf[hi], buf[hi + 1], buf[hi + 2]
+                for x in range(x0, x1):
+                    t = (x - x0 + 0.5) / span
+                    o = (y * sw + x) * 4
+                    buf[o] = int(b0 + (b1 - b0) * t)
+                    buf[o + 1] = int(g0 + (g1 - g0) * t)
+                    buf[o + 2] = int(r0 + (r1 - r0) * t)
+                    buf[o + 3] = 255
+            return bytes(buf)
+        except Exception as e:
+            dbg("patch own window failed: %r" % (e,))
+            return small
+
+    def _end_drag_glass(self):
+        self.drag_active = False
+        self.drag_small = None
+        self.drag_small_size = None
+
+    def _drag_glass_bytes(self, left, top):
+        """按窗口将要到达的屏幕位置，从全屏缩略图里裁出对应区域，放大回 W×H
+
+        left/top 是**目标位置**，不是窗口当前所在位置 —— 拖动时窗口还没搬
+        过去，位置由我们自己算出来，先按目标位置取背景，再和新位置一起提交。
+
+        裁剪在 Python 里按行拼接完成，只用 GdipDrawImageRectI 这一个
+        已验证可用的放大接口 —— GdipDrawImageRectRectI 在这套 ctypes
+        绑定下会「返回成功但一像素都不画」，不能用。"""
+        W, H = self.MW, self.MH
+        sw, sh = self.drag_small_size
+        vx, vy, _, _ = self.vs
+        kx, ky = self.drag_scale
+
+        # 窗口左上角在缩略图坐标系里的**浮点**位置
+        fx = (left - vx) / kx
+        fy = (top - vy) / ky
+        ix, iy = int(floor(fx)), int(floor(fy))
+
+        # 多取 2 个缩略图像素：放大出来要比窗口略大一圈，才留得下亚像素偏移量
+        mx = 2
+        ceil_w = int(ceil(W / kx)) + mx
+        ceil_h = int(ceil(H / ky)) + mx
+        x0, y0 = max(0, ix), max(0, iy)
+        x1, y1 = min(sw, ix + ceil_w), min(sh, iy + ceil_h)
+
+        sdc = self._get_screen_dc()
+        out = _new_dib(sdc, W, H)
+        g = GFX(out[0])
+        try:
+            # 先铺实底：越界区域和裁剪偏差都靠它兜住，不会透出桌面
+            g.fill(0xFF14161A, 0, 0, W, H)
+        finally:
+            g.close()
+
+        if x1 > x0 and y1 > y0:
+            ew, eh = x1 - x0, y1 - y0
+            # 缩略图 1 像素 = 屏幕 kx 像素，所以放大成 ew*kx × eh*ky 之后，
+            # 它和屏幕是 1:1 的 —— 之后按整数屏幕像素平移，画面就能逐像素跟手。
+            bw = max(1, int(round(ew * kx)))
+            bh = max(1, int(round(eh * ky)))
+
+            crop = bytearray(ew * eh * 4)
+            for row in range(y0, y1):
+                so = (row * sw + x0) * 4
+                do = (row - y0) * ew * 4
+                crop[do:do + ew * 4] = self.drag_small[so:so + ew * 4]
+
+            src = _new_dib(sdc, ew, eh)
+            big = _new_dib(sdc, bw, bh)
+            img = P()
+            gb = GFX(big[0])
+            try:
+                ctypes.memmove(src[3], bytes(crop), ew * eh * 4)
+                gdip.GdipCreateBitmapFromScan0(ew, eh, ew * 4, 0x00022009,
+                                               src[3], byref(img))
+                gdip.GdipDrawImageRectI(gb.g, img, 0, 0, bw, bh)
+            finally:
+                gb.close()
+                if img:
+                    try:
+                        gdip.GdipDisposeImage(img)
+                    except Exception:
+                        pass
+                _free_dib(src)
+
+            # 亚像素补偿：窗口相对这块放大图偏了多少整数屏幕像素，就往回贴多少。
+            # 以前这里把位置 round 到缩略图整格，导致「每走 13px 背景才跳一次」，
+            # 慢速拖动时就是一顿一顿的。
+            off_x = int(round((fx - x0) * kx))
+            off_y = int(round((fy - y0) * ky))
+            gdi32.BitBlt(out[0], -off_x, -off_y, bw, bh, big[0], 0, 0, SRCCOPY)
+            _free_dib(big)
+
+        data = bytearray(ctypes.string_at(out[3], W * H * 4))
+        _free_dib(out)
+        data[3::4] = b"\xff" * (W * H)
+        return bytes(data)
+
+    def _drag_frame(self, left, top):
+        """画拖动中的一帧：先按目标位置算好背景，再把「位置 + 内容」一次提交。
+
+        关键就在这个「一次提交」：如果用系统自带的窗口拖动，窗口位置是系统
+        先改的、背景是我们后补的，两者不在同一个合成帧里，DWM 合成时背景
+        永远落后窗口一帧 —— 拖得越快错位越明显，看着就是背景追不上手。
+        自己接管拖动、位置和内容一起交给 UpdateLayeredWindow，就不存在错位。
+
+        返回 True 表示这一帧画了。"""
+        if not (self.drag_active and self.drag_small and self.hwnd_main):
+            return False
+        pos = (left, top)
+        if pos == self.drag_last_pos:
+            return False
+        self.drag_last_pos = pos
+        try:
+            self.mn_glass = self._drag_glass_bytes(left, top)
+        except Exception as e:
+            dbg("drag glass render failed: %r" % (e,))
+            return False
+        self._present_main(w.POINT(left, top))
+        return True
+
+    # ---------- 自己接管的窗口拖动 ----------
+    def _start_main_drag(self):
+        """按下空白处：记下抓手，趁窗口还在原位把整屏缩略出来。
+
+        抓屏放在「按下」这一下、而不是等第一次移动之后：这时窗口还没动过，
+        缩略图里自己的位置是准的；而且用户按下后一般要过一会儿才开始移动，
+        这 40ms 就落在空档里，拖起来不会顿在第一帧。
+        （试过推迟到移动时再抓，点一下确实省了 40ms，但拖动第一帧要等抓屏，
+        会丢掉一个像素的位移 —— 拖动手感比「点一下多花 40ms」重要。）
+
+        不用 ReleaseCapture + WM_NCLBUTTONDOWN 交给系统拖，是因为那样窗口
+        位置由系统改、背景由我们补，两件事不在同一帧里 —— 见 _drag_frame。"""
+        if self.main_drag or self.capturing:
+            return
+        rc = w.RECT()
+        user32.GetWindowRect(self.hwnd_main, byref(rc))
+        p = w.POINT()
+        user32.GetCursorPos(byref(p))
+        self._begin_drag_glass()
+        if not self.drag_active:
+            # 抓不到整屏就别拖了：硬拖会得到一个没有背景的空白窗口
+            return
+        self.main_drag = True
+        self.main_drag_off = (p.x - rc.left, p.y - rc.top)
+        user32.SetCapture(self.hwnd_main)
+
+    def _move_main_drag(self):
+        if not self.main_drag:
+            return
+        p = w.POINT()
+        user32.GetCursorPos(byref(p))
+        self._drag_frame(p.x - self.main_drag_off[0],
+                         p.y - self.main_drag_off[1])
+
+    def _end_main_drag(self):
+        if not self.main_drag:
+            return
+        self.main_drag = False
+        user32.ReleaseCapture()
+        self._end_drag_glass()
+
+    def _corner_cov(self, R):
+        """圆角像素覆盖率（3×3 超采样），结果缓存，只算一次"""
+        if self.mn_cov and self.mn_cov_key == R:
+            return self.mn_cov
+        cov = []
+        for yy in range(R):
+            row = []
+            for xx in range(R):
+                hit = 0
+                for sy in range(3):
+                    for sx in range(3):
+                        dx = R - (xx + (sx + 0.5) / 3.0)
+                        dy = R - (yy + (sy + 0.5) / 3.0)
+                        if dx * dx + dy * dy <= R * R:
+                            hit += 1
+                row.append(int(round(hit * 255.0 / 9.0)))
+            cov.append(row)
+        self.mn_cov, self.mn_cov_key = cov, R
+        return cov
+
+    def _apply_round_mask(self, W, H):
+        """把四角按圆角覆盖率削掉（含抗锯齿）。只处理 4 个角，
+        直边本来就是不透明的，没必要每帧扫全图。"""
+        R = int(round(self.RADIUS))
+        R = max(2, min(R, min(W, H) // 2))
+        cov = self._corner_cov(R)
+        buf = bytearray(ctypes.string_at(self.mn_bits, W * H * 4))
+        for x0, y0, flip_x, flip_y in ((0, 0, False, False),
+                                       (W - R, 0, True, False),
+                                       (0, H - R, False, True),
+                                       (W - R, H - R, True, True)):
+            for j in range(R):
+                ly = (R - 1 - j) if flip_y else j
+                rowcov = cov[ly]
+                base = (y0 + j) * W
+                for i in range(R):
+                    a = rowcov[(R - 1 - i) if flip_x else i]
+                    if a == 255:
+                        continue
+                    o = (base + x0 + i) * 4
+                    if a <= 0:
+                        buf[o] = buf[o + 1] = buf[o + 2] = buf[o + 3] = 0
+                    else:
+                        buf[o] = buf[o] * a // 255          # ULW 要预乘 alpha
+                        buf[o + 1] = buf[o + 1] * a // 255
+                        buf[o + 2] = buf[o + 2] * a // 255
+                        buf[o + 3] = a
+        ctypes.memmove(self.mn_bits, bytes(buf), W * H * 4)
 
     def _draw_main(self, g, W, H):
-        g.fill_round(C_BG, 0, 0, W, H, self.RADIUS)
-        g.fill_round(0x14FFFFFF, 0, 0, W, self.px(2), self.px(2))
+        R = self.RADIUS
+        # 液态玻璃：模糊过的桌面已经垫在下面，这里只叠「压暗层 + 受光高光 + 棱边」
+        g.fill_round(0x80101217, 0, 0, W, H, R)
+        g.fill_round(0x1FFFFFFF, self.px(1), self.px(1),
+                     W - self.px(2), self.px(1.6), max(1.0, R - 1))
+        g.stroke_round(0x59FFFFFF, 1, 0.5, 0.5, W - 1, H - 1, R)
 
         close, hide, btn, hot = self._main_layout()
 
@@ -1378,7 +1956,7 @@ class App:
         # 快捷键行
         hot_hover = (self.hover_main == "hot")
         if self.recording:
-            g.fill_round(0xFF1C2433, hot[0], hot[1], hot[2], hot[3], self.px(9))
+            g.fill_round(0x330A84FF, hot[0], hot[1], hot[2], hot[3], self.px(9))
             g.stroke_round(C_ACCENT, 1, hot[0] + 0.5, hot[1] + 0.5,
                            hot[2] - 1, hot[3] - 1, self.px(9))
             g.text("请按下新的快捷键…", self.px(11.5), C_TITLE,
@@ -1387,7 +1965,7 @@ class App:
             g.text(msg, self.px(11), C_WARN if self.rec_err else C_HINT,
                    hot[0] + hot[2] - self.px(126), hot[1], self.px(114), hot[3], 2)
         else:
-            g.fill_round(0xFF252A33 if hot_hover else C_TAG_BG,
+            g.fill_round(0x3DFFFFFF if hot_hover else C_TAG_BG,
                          hot[0], hot[1], hot[2], hot[3], self.px(9))
             g.text("快捷键", self.px(11), C_HINT, hot[0] + self.px(12), hot[1],
                    self.px(52), hot[3], 0)
@@ -1403,6 +1981,10 @@ class App:
     def _on_main(self, hwnd, msg, wp, lp):
         if msg == WM_PAINT:
             self._paint_main(hwnd)
+            return 0
+        if msg == WM_MOVE:
+            # 拖动时位置由 _drag_frame 随内容一次提交，这里不需要再补画。
+            # 系统拖动循环（WM_ENTERSIZEMOVE/EXITSIZEMOVE）自接管后不会再来。
             return 0
         if msg == WM_ERASEBKGND:
             return 1
@@ -1420,6 +2002,9 @@ class App:
                 self._end_record()
             return 0
         if msg == WM_MOUSEMOVE:
+            if self.main_drag:
+                self._move_main_drag()
+                return 0
             x, y = lo(lp), hi(lp)
             close, hide, btn, hot = self._main_layout()
             hot_id = None
@@ -1467,10 +2052,20 @@ class App:
             if self.recording:
                 self._end_record()
                 return 0
-            # 空白处可拖动窗口
-            user32.ReleaseCapture()
-            user32.SendMessageW(hwnd, 0x00A1, 2, 0)
+            # 空白处可拖动窗口（自己接管，位置与背景同帧提交，见 _drag_frame）
+            self._start_main_drag()
             return 0
+        if msg == WM_LBUTTONUP:
+            if self.main_drag:
+                self._move_main_drag()     # 抬手那一下先对齐到最终位置
+                self._end_main_drag()
+                return 0
+        if msg == WM_CAPTURECHANGED:
+            # 捕获被系统或别的窗口抢走（Alt+Tab、弹窗…）→ 立刻收尾，
+            # 否则窗口会一直黏在鼠标上
+            if self.main_drag:
+                self._end_main_drag()
+                return 0
         if msg == WM_DESTROY:
             user32.PostQuitMessage(0)
             return 0
@@ -1482,6 +2077,8 @@ class App:
     def _show_panel(self):
         if not self.hwnd_main:
             return
+        # 从托盘唤回时重抓玻璃底：藏在托盘期间桌面可能已经变了
+        self._refresh_glass()
         user32.ShowWindow(self.hwnd_main, SW_SHOW)
         user32.SetForegroundWindow(self.hwnd_main)
         user32.InvalidateRect(self.hwnd_main, None, False)
@@ -1490,13 +2087,58 @@ class App:
     def start_capture(self):
         if self.capturing:
             return
+        # 拖动中途被热键打断时，鼠标捕获还挂在主窗口上 —— 不先收尾的话，
+        # 遮罩收不到鼠标（框选失效），主界面还会继续跟着光标跑。
+        self._end_main_drag()
         self.capturing = True
+        try:
+            self._begin_capture()
+        except Exception as e:
+            # 这里一旦漏出去，异常会被窗口过程吞掉，而 capturing 停在 True、
+            # 主窗口还停在“已提交全透明帧”的状态 —— 界面直接消失，热键也
+            # 再也唤不出来，只能重启。所以必须自己兜住并复原。
+            dbg("start_capture failed: %r" % (e,))
+            self._abort_capture()
+
+    def _abort_capture(self):
+        """截图流程中途失败时复原，让程序回到「可以直接再截一次」的状态。"""
+        self.main_rect = None
+        try:
+            if self.hwnd_overlay:
+                user32.DestroyWindow(self.hwnd_overlay)
+                self.hwnd_overlay = None
+            self._close_tool()
+            self._release_capture_buffers()
+        finally:
+            self.capturing = False
+            if self.hwnd_main:
+                self._present_main()      # 开头提交过一帧全透明，这里必须画回来
+
+    def _begin_capture(self):
         if self.recording:
             self._end_record()
         self.main_was_visible = bool(self.hwnd_main and user32.IsWindowVisible(self.hwnd_main))
+        self.main_rect = None
         if self.hwnd_main:
-            user32.ShowWindow(self.hwnd_main, SW_HIDE)
-        time.sleep(0.12)
+            # 不 SW_HIDE：窗口保持“可见”状态，只是这一瞬间提交一帧全透明，
+            # 这样抓屏拿不到我们自己的窗口（截图里不会出现 SnapLite），
+            # 但也不会出现「隐藏 → 弹出」那种闪烁和位置变化。
+            #
+            # 代价是屏幕上那块像素也没了，而遮罩要画“桌面上的主界面”，所以：
+            # 提交透明帧之前先把这一帧像素和窗口位置留底，抓完屏再补回抓屏图里。
+            # 之后主窗口一直保持全透明，由遮罩里的副本顶替显示 —— 这样它就跟
+            # 桌面上一个普通窗口一样：没框到时跟着变灰，框到时随选区变亮。
+            if self.main_was_visible:
+                self._present_main()          # 确保留底的是屏幕上真正那一帧
+                rc = w.RECT()
+                user32.GetWindowRect(self.hwnd_main, byref(rc))
+                self.main_rect = (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top)
+                self._keep_main_surface()
+            self._present_blank()
+            try:
+                dwmapi.DwmFlush()
+            except Exception:
+                time.sleep(0.05)
 
         # 每次截图前重新读虚拟屏幕尺寸：运行中插拔显示器、改分辨率或改缩放后，
         # 用启动时的旧尺寸会让遮罩盖不满（露白边），抓屏和裁剪也跟着错位。
@@ -1532,8 +2174,7 @@ class App:
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, "SnapLiteOverlay", "",
             WS_POPUP, vsx, vsy, vsw, vsh, None, None, self.hinst, None)
         if not self.hwnd_overlay:
-            self.capturing = False
-            return
+            raise RuntimeError("overlay window create failed")
         # 先把整帧合成好，再用 UpdateLayeredWindow 一次性呈现 → 无白屏/黑屏过渡帧
         cx, cy = vsw // 2, vsh // 2
         self.mouse = (cx, cy)
@@ -1543,6 +2184,11 @@ class App:
         user32.ShowWindow(self.hwnd_overlay, SW_SHOWNA)
         user32.SetForegroundWindow(self.hwnd_overlay)
         user32.SetFocus(self.hwnd_overlay)
+        # 主界面这里**不再**提 Z 序：它现在是全透明的一帧，画面由遮罩里的
+        # 副本负责。以前为了让主界面一直亮着把它顶到遮罩之上，结果不管有没有
+        # 框到它都是置顶的（不会变灰），而且之后任何一次 Z 序重排（展开工具条
+        # 选项排、点遮罩…）都可能把它压到整屏遮罩下面 —— 看起来就是“主界面
+        # 莫名消失”，取消截图才回来。
 
     def _present_overlay(self):
         """把 dc_back 的内容原子提交到分层窗口（ULW_OPAQUE，不涉及 alpha 通道）"""
@@ -1573,6 +2219,8 @@ class App:
             setattr(self, "bmp_" + name, bmp)
             setattr(self, "dc_" + name + "_old", old)
         gdi32.BitBlt(self.dc_shot, 0, 0, vsw, vsh, sdc, vsx, vsy, SRCCOPY)
+        # 抓屏时主窗口是全透明的，先把它的像素补回原位再生成压暗层
+        self._blend_main_into_shot()
 
         # 呈现用的缓冲必须是 DIB（分层窗口只能吃 DIB 段）
         bi = BITMAPINFO()
@@ -1611,8 +2259,12 @@ class App:
         if self.hdc_screen:
             user32.ReleaseDC(None, self.hdc_screen)
             self.hdc_screen = None
+        self._release_screen_dc()
         self.shot_raw = None
         self._mos_cache = {}
+        # 玻璃底取自这套缓冲，缓冲一换就必须作废
+        self.tb_glass = None
+        self.tb_glass_key = None
 
     # ---------- 自动识别
     def _request_probe(self, sx, sy, force=False):
@@ -2409,9 +3061,12 @@ class App:
         self.redo_stack = []
         self.drag_snap = None
         self.capturing = False
+        self.main_rect = None
         if self.main_was_visible and self.hwnd_main:
             user32.ShowWindow(self.hwnd_main, SW_SHOW)
-            user32.InvalidateRect(self.hwnd_main, None, False)
+            # 截图期间主窗口停在“全透明”那一帧，这里必须显式画回来。
+            # 一帧就提交整窗内容，不需要再 InvalidateRect 触发第二次重绘。
+            self._present_main()
             user32.SetForegroundWindow(self.hwnd_main)
         self.main_was_visible = False
 
@@ -2634,7 +3289,7 @@ class App:
         py_ = max(vsy + self.px(6), min(py_, vsy + vsh - hh - self.px(6)))
         self.tb_pos = (px_, py_)
 
-        topmost = ctypes.c_void_p(0xFFFFFFFFFFFFFFFF)   # HWND_TOPMOST(-1)
+        topmost = w.HWND(HWND_TOPMOST)
         if self.hwnd_tool:
             # 已存在就原地改尺寸/位置：销毁重建会丢掉正在进行的点击
             user32.SetWindowPos(self.hwnd_tool, topmost, px_, py_, ww, hh,
@@ -2661,7 +3316,7 @@ class App:
         “菜单消失了，按一下右键才回来”（右键会重排工具条 → SetWindowPos 把它顶回去）。"""
         if not self.hwnd_tool:
             return
-        user32.SetWindowPos(self.hwnd_tool, ctypes.c_void_p(0xFFFFFFFFFFFFFFFF),
+        user32.SetWindowPos(self.hwnd_tool, w.HWND(HWND_TOPMOST),
                             0, 0, 0, 0,
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
@@ -2673,12 +3328,23 @@ class App:
         self._release_tool_surface()
 
     # ---------- 逐像素透明呈现（圆角抗锯齿，不再走窗口区域裁剪）
+    def _tool_layout_key(self):
+        """布局签名。
+
+        画笔 / 马赛克 / 箭头三种模式的选项排**宽高完全一样**（都是 682×92），
+        只有里面矩形的位置和个数不同。以前表面重建只比 tb_size，
+        于是切模式时沿用了上一种模式的蒙版和玻璃形状 —— 轻重不一样的地方
+        冒出一块不该有的毛玻璃，重的地方控件被蒙版裁掉，就是“错乱 + 残留”。"""
+        ww, hh, rects = self._tool_layout()
+        return (ww, hh, tuple(rects))
+
     def _ensure_tool_surface(self):
-        ww, hh, _ = self._tool_layout()
-        if self.tb_dc and self.tb_size == (ww, hh):
+        key = self._tool_layout_key()
+        if self.tb_dc and self.tb_key == key:
             return
         self._release_tool_surface()
-        sdc = self.hdc_screen or user32.GetDC(None)
+        ww, hh = key[0], key[1]
+        sdc = self._get_screen_dc()
         bi = BITMAPINFO()
         bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER)
         bi.bmiHeader.biWidth = ww
@@ -2692,7 +3358,8 @@ class App:
         old = gdi32.SelectObject(dc, bmp)
         self.tb_dc, self.tb_bmp, self.tb_old, self.tb_bits = dc, bmp, old, bits
         self.tb_size = (ww, hh)
-        self.tb_mask, self.tb_edge = self._build_tool_mask(ww, hh, self.px(12))
+        self.tb_key = key
+        self.tb_mask, self.tb_edge = self._build_tool_mask(ww, hh)
         self.tb_scale = bytes(min(255, i * TB_ALPHA // 255) for i in range(256))
         self.tb_alpha = bytes(min(255, v * TB_ALPHA // 255) for v in self.tb_mask)
 
@@ -2708,10 +3375,16 @@ class App:
         self.tb_old = None
         self.tb_bits = None
         self.tb_size = None
+        self.tb_key = None
         self.tb_mask = None
         self.tb_edge = None
+        # 玻璃底跟尺寸/位置/遮罩内容绑定，表面重建时必须一并作废
+        self.tb_glass = None
+        self.tb_glass_key = None
+        self.tb_cov = None
+        self.tb_cov_key = None
 
-    def _build_tool_mask(self, W, H, rad=None):
+    def _build_tool_mask(self, W, H):
         """覆盖蒙版：只负责“哪些像素属于按钮区域”，形状细节交给 GDI+ 抗锯齿。
         以前这里用圆角 SDF 覆盖 alpha，会把 GDI+ 已经算好的抗锯齿边重新压硬 —— 锯齿就是这么来的。
         现在还要往外放一圈 pad：颜色点选中时的白色高亮环画在圆点矩形之外，
@@ -2732,6 +3405,96 @@ class App:
                 mask[o + xa:o + xb] = row
         return mask, None
 
+    def _tool_shape_cov(self, W, H):
+        """**只有主排那 8 个按钮**的形状覆盖率（玻璃底只贴在它们身上）。
+
+        选项排（颜色点 / 粗细 / 笔头 / 块大小）不给玻璃底：它们是圆点和小按钮，
+        自己带底色，垫一层模糊玻璃只会在字后面多出一块方块，切换模式时还容易
+        看出错位。GDI+ 画形状取 alpha = 带抗锯齿的最准形状；按钮之间那几个像素
+        的缝必须保持全透明，否则整条工具条会变成一块大玻璃，版式就变了。"""
+        key = self._tool_layout_key()
+        if self.tb_cov is not None and self.tb_cov_key == key:
+            return self.tb_cov
+        sdc = self._get_screen_dc()
+        d = _new_dib(sdc, W, H)
+        try:
+            g = GFX(d[0])
+            try:
+                for (name, x, y, ww, hh) in self._tool_layout()[2]:
+                    if name != "@btn":
+                        continue
+                    g.fill_round(0xFFFFFFFF, x, y, ww, hh, self.px(12))
+            finally:
+                g.close()
+            cov = bytes(ctypes.string_at(d[3], W * H * 4)[3::4])
+        finally:
+            _free_dib(d)
+        self.tb_cov, self.tb_cov_key = cov, key
+        return cov
+
+    def _tool_glass_layer(self, W, H, pos):
+        """工具条背后的磨砂底。
+
+        不抓屏：工具条飘在遮罩上方，抓屏抓到的就是它自己。遮罩里本来就存着
+        「该位置的桌面」——dc_dim 是压暗后的整屏原图，dc_shot 是原图；选区
+        在遮罩里是亮的，所以落在选区里的那一块要从 dc_shot 取。取完模糊，
+        再用按钮形状覆盖率削出形状，就是一块「按位置贴合的玻璃」。"""
+        if not (self.dc_dim and self.dc_shot):
+            return None
+        key = (pos[0], pos[1], W, H, self.sel, self.use_shot_glass,
+               self._tool_layout_key())
+        if self.tb_glass is not None and self.tb_glass_key == key:
+            return self.tb_glass
+
+        vx, vy, vw, vh = self.vs
+        lx, ly = int(pos[0]) - vx, int(pos[1]) - vy
+        sx0, sy0 = max(0, lx), max(0, ly)
+        sx1, sy1 = min(vw, lx + W), min(vh, ly + H)
+        if sx1 <= sx0 or sy1 <= sy0:
+            return None
+
+        sdc = self._get_screen_dc()
+        d = _new_dib(sdc, W, H)
+        try:
+            if self.use_shot_glass:
+                # 玻璃底取「原图」而不是压暗后的：磨砂才看得出来
+                gdi32.BitBlt(d[0], sx0 - lx, sy0 - ly, sx1 - sx0, sy1 - sy0,
+                             self.dc_shot, sx0, sy0, SRCCOPY)
+            else:
+                gdi32.BitBlt(d[0], sx0 - lx, sy0 - ly, sx1 - sx0, sy1 - sy0,
+                             self.dc_dim, sx0, sy0, SRCCOPY)
+            sel = self.sel
+            if sel and sel[2] > 0 and sel[3] > 0 and not self.use_shot_glass:
+                ix0, iy0 = max(sx0, sel[0]), max(sy0, sel[1])
+                ix1 = min(sx1, sel[0] + sel[2])
+                iy1 = min(sy1, sel[1] + sel[3])
+                if ix1 > ix0 and iy1 > iy0:
+                    gdi32.BitBlt(d[0], ix0 - lx, iy0 - ly, ix1 - ix0, iy1 - iy0,
+                                 self.dc_shot, ix0, iy0, SRCCOPY)
+            raw = ctypes.string_at(d[3], W * H * 4)
+        finally:
+            _free_dib(d)
+
+        data = bytearray(self._blur_bgra(raw, W, H))
+        cov = self._tool_shape_cov(W, H)
+        # 形状外的像素直接扔掉（按钮之间要能看见遮罩，缝不能糊上一层玻璃）；
+        # 形状边缘按覆盖率预乘颜色 —— ULW 与 GDI+ 都按预乘 alpha 处理，
+        # 不预乘的话圆角会有一圈偏亮的边。
+        for i, a in enumerate(cov):
+            if a == 255:
+                continue
+            o = i * 4
+            if a == 0:
+                data[o] = data[o + 1] = data[o + 2] = 0
+            else:
+                data[o] = data[o] * a // 255
+                data[o + 1] = data[o + 1] * a // 255
+                data[o + 2] = data[o + 2] * a // 255
+        data[3::4] = cov
+        layer = bytes(data)
+        self.tb_glass, self.tb_glass_key = layer, key
+        return layer
+
     def _present_tool(self):
         """整帧合成后一次性提交（per-pixel alpha），无锯齿、无闪烁"""
         if not self.hwnd_tool:
@@ -2739,7 +3502,12 @@ class App:
         self._ensure_tool_surface()
         W, H = self.tb_size
         total = W * H * 4
-        ctypes.memset(self.tb_bits, 0, total)
+        glass = self._tool_glass_layer(W, H, self.tb_pos)
+        if glass:
+            # 先垫玻璃底，按钮的底色是半透明的 → 抹上去就是磨砂，不是实心灰
+            ctypes.memmove(self.tb_bits, glass, total)
+        else:
+            ctypes.memset(self.tb_bits, 0, total)
 
         g = GFX(self.tb_dc)
         self._draw_tool(g, W, H)
@@ -2773,7 +3541,7 @@ class App:
         size = w.SIZE(W, H)
         pt_src = w.POINT(0, 0)
         bf = BLENDFUNCTION(0, 0, 255, 1)      # AC_SRC_OVER + AC_SRC_ALPHA
-        sdc = self.hdc_screen or user32.GetDC(None)
+        sdc = self._get_screen_dc()
         user32.UpdateLayeredWindow(self.hwnd_tool, sdc, byref(pt_dst), byref(size),
                                    self.tb_dc, byref(pt_src), 0, byref(bf), 2)
 
@@ -2830,7 +3598,7 @@ class App:
             elif name.startswith("@penw"):
                 k = int(name[5:])
                 on = (self.pen_width == k)
-                g.fill_round(C_ACCENT if on else 0xFF262B33, x, y, ww, hh, self.px(9))
+                g.fill_round(C_ACCENT if on else C_TB_BTN, x, y, ww, hh, self.px(9))
                 if not on:
                     g.stroke_round(0x1FFFFFFF, 1, x + 0.5, y + 0.5,
                                    ww - 1, hh - 1, self.px(9))
@@ -2840,7 +3608,7 @@ class App:
                 is_brush = name.startswith("@brush")
                 k = int(name[6:])
                 on = (self.mosaic_brush == k) if is_brush else (self.mosaic_block == k)
-                g.fill_round(C_ACCENT if on else 0xFF262B33, x, y, ww, hh, self.px(9))
+                g.fill_round(C_ACCENT if on else C_TB_BTN, x, y, ww, hh, self.px(9))
                 if not on:
                     g.stroke_round(0x1FFFFFFF, 1, x + 0.5, y + 0.5,
                                    ww - 1, hh - 1, self.px(9))
@@ -2882,7 +3650,11 @@ class App:
             g.stroke_round(color, lw, x + 4.6 * u, y + 1.6 * u,
                            8.8 * u, 8.8 * u, 2.2 * u)
             if bg is not None:
-                g.fill_round(bg, x + 0.9 * u, y + 4.5 * u, 8.9 * u, 8.9 * u, 2.3 * u)
+                # 这张“前纸”的填充要盖住下面那张纸的线条，必须不透明。
+                # 按钮底色已经改成半透明（磨砂），直接拿它填会在图标处
+                # 把玻璃底再压暗一层，看起来像多了一块深色方块。
+                g.fill_round(bg | 0xFF000000, x + 0.9 * u, y + 4.5 * u,
+                             8.9 * u, 8.9 * u, 2.3 * u)
             g.stroke_round(color, lw, x + 1.6 * u, y + 4.6 * u,
                            8.8 * u, 8.8 * u, 2.2 * u)
         elif kind == "save":
@@ -3323,6 +4095,10 @@ class App:
         # 工具条的离屏表面（DC + DIB）也要释放，否则退出时留一堆 GDI 句柄
         try:
             self._release_tool_surface()
+        except Exception:
+            pass
+        try:
+            self._release_main_surface()
         except Exception:
             pass
         if self.hwnd_overlay:
