@@ -27,6 +27,7 @@ except Exception:
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "assets", "_dbg_tool_opts.png")
 BG = (72, 78, 88)          # 中灰：既看得清浅色，也看得清深色
+SCALE = 3                  # 放大倍数：1px 的偏差放大后肉眼才看得出来
 
 
 def to_rgba(raw, W, H, bg=BG):
@@ -79,7 +80,8 @@ app._close_tool()
 tw = max(t[1] for t in tiles)
 th = sum(t[2] for t in tiles) + 10 * max(0, len(tiles) - 1)
 pad = 8
-TW, TH = tw + pad * 2, th + pad * 2
+TW = (tw + pad * 2) * SCALE
+TH = (th + pad * 2) * SCALE
 
 sdc = app._get_screen_dc()
 dc, bmp, old, bits = snap._new_dib(sdc, TW, TH)
@@ -96,14 +98,16 @@ for i in range(TW * TH):
 y = pad
 for tag, W, H, rgba in tiles:
     for row in range(H):
-        src = row * W * 4
-        dst = ((y + row) * TW + pad) * 4
         for xx in range(W):
-            s = src + xx * 4
-            d = dst + xx * 4
-            canvas[d] = rgba[s + 2]
-            canvas[d + 1] = rgba[s + 1]
-            canvas[d + 2] = rgba[s]
+            s = (row * W + xx) * 4
+            r, gg, b = rgba[s], rgba[s + 1], rgba[s + 2]
+            for dy in range(SCALE):
+                base = (((y + row) * SCALE + dy) * TW + (pad + xx) * SCALE) * 4
+                for dx in range(SCALE):
+                    d = base + dx * 4
+                    canvas[d] = b
+                    canvas[d + 1] = gg
+                    canvas[d + 2] = r
     y += H + 10
 
 hold = ctypes.create_string_buffer(bytes(canvas), len(canvas))

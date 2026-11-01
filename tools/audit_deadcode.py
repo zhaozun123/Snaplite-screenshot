@@ -35,9 +35,11 @@ def report(title, items):
     print('=' * 60)
     dead = []
     for name, ln in items:
-        # 定义处算 1 次引用；再算实际引用
+        # 只统计「使用处」：FunctionDef 的 name 不是 ast.Name 节点，定义本身
+        # 不产生计数。所以 refs==0 才是真没人用；写成 n<=1 会把「只被调用
+        # 一次」的函数全部误报成死代码（托盘、保存那几个就是这么被冤枉的）。
         n = used[name]
-        if n <= 1:
+        if n == 0:
             dead.append((name, ln, n))
     for name, ln, n in dead:
         print('  DEAD? %-28s line %-6s refs=%d' % (name, ln, n))
@@ -51,12 +53,14 @@ d3 = report('顶层常量（引用<=1 视为未使用）', top_consts)
 
 # 类方法
 print('=' * 60)
-print('类方法（引用<=1 视为未使用）')
+print('类方法（refs==0 才算未使用）')
 print('=' * 60)
 for cls in [n for n in tree.body if isinstance(n, ast.ClassDef)]:
     for m in cls.body:
         if isinstance(m, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if m.name.startswith('__') and m.name.endswith('__'):
                 continue
-            if used[m.name] <= 1:
+            # 同上：定义不计数，所以「只调用一次」是 refs==1，正常；
+            # refs==0 才是真的没人调。
+            if used[m.name] == 0:
                 print('  DEAD? %s.%-26s line %-6s refs=%d' % (cls.name, m.name, m.lineno, used[m.name]))

@@ -7,9 +7,14 @@ SnapLite - 轻量截图工具
   · 全局热键唤起（可在面板或托盘菜单里改成任意组合）
   · 自动识别鼠标下的窗口/控件区域，单击直接捕获；也可自由拖拽框选
   · 框选后可用 8 个手柄调整范围、拖动整体移动
-  · 画笔 / 马赛克 / 箭头标注
+  · 画笔 / 马赛克 / 箭头 / 方框 / 圆形标注
   · 复制到剪贴板 / 保存为 PNG
   · 常驻托盘；✕ 与 — 均为收进托盘，退出在托盘右键菜单
+
+代码结构：
+  单文件约 4700 行，顶层依次是：Win32 结构体与函数原型 → 配置 → 配色常量
+  → GFX（GDI+ 绘图封装）→ 屏幕抓取 → 悬停自动识别 → App（程序主体）。
+  App 内部按职责分八段，搜「=== N.」可跳到每段开头，段目见 App 的类说明。
 """
 import ctypes
 import os
@@ -49,7 +54,7 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "SnapLite"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 APP_TITLE = "%s %s" % (APP_NAME, APP_VERSION)
 
 DEBUG = bool(os.environ.get("SNAPLITE_DEBUG"))
@@ -73,6 +78,7 @@ def _write_log(path, text):
 
 
 def dbg(msg):
+    """调试日志：只在 DEBUG 打开时写文件，正式版一次磁盘 IO 都不做"""
     if not DEBUG:
         return
     _write_log(DEBUG_LOG, "%s  %s\n" % (time.strftime("%H:%M:%S"), msg))
@@ -101,6 +107,7 @@ DEFAULT_VK = 0x41                      # A
 
 
 def load_config():
+    """读快捷键配置。文件不存在、读不出来、内容非法，一律退回默认 Ctrl+Alt+A"""
     mod, vk = DEFAULT_MOD, DEFAULT_VK
     try:
         with open(CFG_FILE, "r", encoding="utf-8") as f:
@@ -122,6 +129,7 @@ def load_config():
 
 
 def save_config(mod, vk):
+    """写快捷键配置，返回是否成功。失败（无权限等）不影响程序继续跑"""
     try:
         if not os.path.isdir(CFG_DIR):
             os.makedirs(CFG_DIR)
@@ -151,9 +159,18 @@ WM_ACTIVATE = 0x0006
 WM_SETCURSOR = 0x0020
 WM_MOUSELEAVE = 0x02A3
 WM_HOTKEY = 0x0312
+WM_TIMER = 0x0113
 WM_CAPTURECHANGED = 0x0215
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
+
+# 玻璃底自动跟随：监听「别的窗口动了 / 显示了 / 切换了」
+TIMER_GLASS = 0x51
+GLASS_TICK_MS = 90               # 桌面变了以后最多等这么久重算一次（约 11fps）
+EVENT_SYSTEM_FOREGROUND = 0x0003
+EVENT_OBJECT_LOCATIONCHANGE = 0x800B
+WINEVENT_OUTOFCONTEXT = 0x0000
+WINEVENT_SKIPOWNPROCESS = 0x0002
 
 WS_POPUP = 0x80000000
 WS_EX_TOPMOST = 0x00000008
@@ -171,6 +188,11 @@ SW_SHOWNA = 8
 
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
+
+# 「抓屏时排除自己」的窗口显示属性（SetWindowDisplayAffinity）
+WDA_NONE = 0x00000000
+WDA_EXCLUDEFROMCAPTURE = 0x00000011
+CAPTURE_EXCLUDE_MIN_BUILD = 19041    # Win10 2004 才有；更早的系统会抓一片黑
 
 GW_HWNDNEXT = 2
 
@@ -284,14 +306,45 @@ class OPENFILENAMEW(Structure):
 
 
 def _guid(d1, d2, d3, tail):
+    """按四段拼一个 GUID 结构体。GDI+ 保存图片要传编码器 CLSID"""
     return GUID(d1, d2, d3, (c_ubyte * 8)(*tail))
 
 
 PNG_CLSID = _guid(0x557CF406, 0x1A04, 0x11D3, (0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E))
 
 
+class RTL_OSVERSIONINFOW(ctypes.Structure):
+    """RtlGetVersion 的入参/出参。GetVersionEx 会被兼容层按 manifest 骗，
+    这个不会 —— 判断「系统支持哪个 API」时必须以它为准。"""
+    _fields_ = [("dwOSVersionInfoSize", c_ulong), ("dwMajorVersion", c_ulong),
+                ("dwMinorVersion", c_ulong), ("dwBuildNumber", c_ulong),
+                ("dwPlatformId", c_ulong), ("szCSDVersion", c_wchar * 128)]
+
+
+_win_build_cache = [0]
+
+
+def win_build():
+    """真实的 Windows build 号（如 19045 / 22631），取不到返回 0"""
+    if not _win_build_cache[0]:
+        try:
+            fn = _proto(windll.ntdll.RtlGetVersion,
+                        [POINTER(RTL_OSVERSIONINFOW)], c_long)
+            vi = RTL_OSVERSIONINFOW()
+            vi.dwOSVersionInfoSize = sizeof(RTL_OSVERSIONINFOW)
+            fn(byref(vi))
+            _win_build_cache[0] = int(vi.dwBuildNumber)
+        except Exception:
+            _win_build_cache[0] = 0
+    return _win_build_cache[0]
+
+
 # ============================================================ 函数原型
 def _proto(fn, args, ret=c_int):
+    """统一声明 DLL 函数签名。
+
+    64 位下不声明 argtypes，指针会被当成 32 位 int 截断 —— 表现是随机
+    报错或直接崩溃，而且崩在莫名奇妙的地方。所有 DLL 调用都必须过这里。"""
     fn.argtypes = args
     fn.restype = ret
     return fn
@@ -350,6 +403,9 @@ _proto(user32.SetCapture, [w.HWND], w.HWND)
 _proto(user32.WindowFromPoint, [w.POINT], w.HWND)
 _proto(user32.SetWindowRgn, [w.HWND, w.HANDLE, w.BOOL], c_int)
 _proto(user32.SetLayeredWindowAttributes, [w.HWND, w.DWORD, c_ubyte, w.DWORD], w.BOOL)
+# 让窗口「抓屏时不存在，屏幕上照常显示」。Win10 2004 起才能拿到背后内容，
+# 更早的系统会退化成抓一片黑，所以调用前必须先过 win_build() 判断。
+_proto(user32.SetWindowDisplayAffinity, [w.HWND, w.DWORD], w.BOOL)
 _proto(user32.UpdateLayeredWindow, [w.HWND, w.HDC, POINTER(w.POINT), POINTER(w.SIZE),
                                    w.HDC, POINTER(w.POINT), w.DWORD, c_void_p, w.DWORD],
        w.BOOL)
@@ -357,6 +413,16 @@ _proto(user32.RegisterHotKey, [w.HWND, c_int, c_uint, c_uint], w.BOOL)
 _proto(user32.UnregisterHotKey, [w.HWND, c_int], w.BOOL)
 _proto(user32.GetKeyState, [c_int], c_short)
 _proto(user32.GetAsyncKeyState, [c_int], c_short)
+
+# 窗口事件钩子：别的窗口一动就知道，玻璃底才有得跟
+WINEVENTPROC = WINFUNCTYPE(None, w.HANDLE, w.DWORD, w.HWND, w.LONG, w.LONG,
+                           w.DWORD, w.DWORD)
+_proto(user32.SetWinEventHook, [w.DWORD, w.DWORD, w.HANDLE, WINEVENTPROC,
+                                w.DWORD, w.DWORD, w.DWORD], w.HANDLE)
+_proto(user32.UnhookWinEvent, [w.HANDLE], w.BOOL)
+_proto(user32.SetTimer, [w.HWND, ctypes.c_size_t, w.UINT, c_void_p], ctypes.c_size_t)
+_proto(user32.KillTimer, [w.HWND, ctypes.c_size_t], w.BOOL)
+
 _proto(user32.MapVirtualKeyW, [c_uint, c_uint], c_uint)
 _proto(user32.ReleaseCapture, [], w.BOOL)
 _proto(user32.TrackMouseEvent, [POINTER(TRACKMOUSEEVENT)], w.BOOL)
@@ -411,6 +477,7 @@ _proto(gdip.GdipFillPath, [P, P, P])
 _proto(gdip.GdipFillPolygon, [P, P, POINTER(PointF), c_int, c_int])
 _proto(gdip.GdipFillEllipse, [P, P, c_float, c_float, c_float, c_float])
 _proto(gdip.GdipDrawEllipse, [P, P, c_float, c_float, c_float, c_float])
+_proto(gdip.GdipAddPathRectangle, [P, c_float, c_float, c_float, c_float])
 _proto(gdip.GdipSetClipRect, [P, c_float, c_float, c_float, c_float, c_int])
 _proto(gdip.GdipResetClip, [P])
 _proto(gdip.GdipSaveGraphics, [P, POINTER(c_int)])
@@ -467,7 +534,12 @@ _proto(dwmapi.DwmFlush, [], c_long)
 _proto(windll.kernel32.GlobalAlloc, [c_uint, ctypes.c_size_t], c_void_p)
 _proto(windll.kernel32.GlobalLock, [c_void_p], c_void_p)
 _proto(windll.kernel32.GlobalUnlock, [c_void_p], w.BOOL)
+# GlobalFree 必须声明：入参是 HGLOBAL 句柄，不声明会被当成 32 位 int 截断，
+# 表现是释放到一个非法地址 —— 要么直接崩，要么悄悄漏掉这块内存。
+# 返回值同样是 HGLOBAL，NULL 才算成功。
+_proto(windll.kernel32.GlobalFree, [c_void_p], c_void_p)
 _proto(windll.kernel32.GetModuleHandleW, [w.LPCWSTR], w.HINSTANCE)
+_proto(windll.kernel32.GetCurrentProcessId, [], w.DWORD)
 
 
 # ============================================================ 配色
@@ -495,9 +567,63 @@ C_TB_COPY_ICO = 0xFF7FB2FF           # 只有图标带蓝，暗示这是主操�
 C_TB_CANCEL_TXT = 0xFFFFDCE1
 C_TB_CANCEL_ICO = 0xFFE8697A
 TB_ALPHA = 242          # 整组半透明（0-255），略透出背后内容
+# 工具条整体缩放。下面所有 TB_* 尺寸是 TB_SCALE=1.0 时的设计稿数值，
+# 实际像素 = TB_* × TB_SCALE × DPI 缩放（见 App.tb）。
+# 想整体大一点/小一点只改这一个数，别再逐个调按钮宽高和字号。
+# 0.86：按钮 76→65、高 44→38、字号 12→10，整条 796→677（1920 屏宽的 35%）。
+# 选它是因为实测这一档在 100% 缩放的屏上，字仍然清晰、也没挤到边。
+# 注意它同时作用于图标和字号，所以不要和 TB_BTN_W 各自乱调 —— 会错位。
+TB_SCALE = 0.86
+# 字号单独缩放，故意和 TB_SCALE 不同步。
+# 外框按 0.86 收能省 120px 宽度，但字号跟着缩到 10px 就偏小了 —— 中文在 10px
+# 下笔画会糊成一片。所以字号只按 0.92 收（12 → 11px）：外框小一圈，字几乎不变小。
+# 改这里只影响文字大小，不影响按钮、图标、圆角。
+TB_FONT_SCALE = 0.92
+# 按钮版式。这几个数决定工具条总宽 = TB_BTN_W×N + TB_BTN_GAP×(N-1)。
+# 按钮内部不再用固定坐标摆图标和文字，而是「图标 + 缝 + 文字」作为一整块
+# 在按钮里水平居中（见 _draw_tool）。这里写的是 TB_SCALE=1.0 时的设计稿宽度：
+# 最宽的标签「马赛克」12px 实测 41.1 + 图标 17 + 缝 6 + 左右各留 6 ≈ 76。
+# 真正会不会被挤出按钮，由 tests/test_tb_center.py 的「单行没折」一项把关
+# —— 改 TB_SCALE / TB_FONT_SCALE / 标签文字后都要跑它。
+TB_BTN_W = 76           # 单颗按钮宽
+TB_BTN_H = 44           # 单颗按钮高
+TB_BTN_GAP = 4          # 按钮之间的缝（缝必须全透明，见 _tool_shape_cov）
+TB_ICON_SIZE = 17       # 图标边长
+TB_ICON_GAP = 6         # 图标右边缘到文字左边缘的缝
+# 每个图标在 TB_ICON_SIZE 方框里的「真实墨迹边界」(左, 上, 右, 下)，闭区间。
+# 图标是画在 15 单位网格上的，但墨迹并没有占满：× 只占中间 11px，框选图标
+# 占满 15px。不记这个，按方框居中就会让「取消」看起来偏右 6px。
+# 由 tools/measure_ink.py 量出；tests/test_tb_center.py 会校验这张表没过期。
+TB_ICON_INK = {
+    "reselect": (1, 1, 15, 15),
+    "pen": (3, 3, 14, 13),
+    "mosaic": (2, 2, 15, 15),
+    "arrow": (3, 3, 13, 13),
+    "rect": (2, 3, 14, 13),
+    "ellipse": (2, 3, 15, 13),
+    "undo": (2, 4, 13, 11),
+    "copy": (1, 1, 15, 15),
+    "save": (3, 2, 13, 14),
+    "cancel": (3, 4, 13, 13),
+}
+# 中文字形在字宽里左右留的空白（side bearing）。measure() 返回的是推进宽度，
+# 比肉眼看到的字形两侧各宽出这么多；拿推进宽度当居中依据，内容会整体偏左。
+# 实测 12px 下：左侧 2~3px、右侧 3.7px，取中位数。
+TB_TEXT_SIDE_L = 2.5
+TB_TEXT_SIDE_R = 3.7
+# 文字垂直补偿：GDI+ 的「行内居中」按字体行高算，而微软雅黑的行高里
+# descent 部分留白多，实际字形会整体偏上。实测 12px 下偏上 1px，
+# 用整数补偿（半像素位移会让字形发虚），补完文字和图标就落在同一条线上。
+TB_TEXT_DY = 1
 TB_ITEMS = (("reselect", "重选"), ("pen", "画笔"), ("mosaic", "马赛克"),
-            ("arrow", "箭头"), ("undo", "撤销"), ("copy", "复制"),
+            ("arrow", "箭头"), ("rect", "方框"), ("ellipse", "圆形"),
+            ("undo", "撤销"), ("copy", "复制"),
             ("save", "保存"), ("cancel", "取消"))
+
+# 方框 / 圆形：拖动两个对角画出来；选中后拖四角改大小
+BOX_HANDLE_R = 5          # 角上手柄半径
+BOX_HIT_TOL = 7           # 点到边框多近算选中
+BOX_MIN_SIZE = 6          # 小于这个尺寸当作误点，不落笔
 C_WHITE = 0xFFFFFFFF
 C_WARN = 0xFFF08A8A
 
@@ -528,10 +654,12 @@ PIXEL_HALF = 2
 
 
 def lo(v):
+    """取低 16 位并转成有符号数（拆鼠标消息里的 x 坐标）"""
     return c_short(v & 0xFFFF).value
 
 
 def hi(v):
+    """取高 16 位并转成有符号数（拆鼠标消息里的 y 坐标）"""
     return c_short((v >> 16) & 0xFFFF).value
 
 
@@ -546,6 +674,7 @@ _VK_SPECIAL = {
 
 
 def vk_name(vk):
+    """虚拟键码 → 给人看的名字（F1 / Enter / A…），认不出就显示 VK 十六进制"""
     if 0x70 <= vk <= 0x87:
         return "F%d" % (vk - 0x70 + 1)
     if vk in _VK_SPECIAL:
@@ -557,6 +686,7 @@ def vk_name(vk):
 
 
 def hotkey_label(mod, vk):
+    """把修饰键和主键拼成 Ctrl+Alt+A 这种文本，界面和托盘提示都用它"""
     parts = []
     if mod & MOD_CONTROL:
         parts.append("Ctrl")
@@ -570,14 +700,14 @@ def hotkey_label(mod, vk):
     return "+".join(parts)
 
 
-# ============================================================ 多行文字拆分
-
-
 # ============================================================ 绘图封装
 class GFX:
     """GDI+ 轻量封装"""
 
     def __init__(self, hdc=None, ptr=None):
+        """绑定一块画布（HDC 或已有 Graphics），并统一打开抗锯齿等绘制模式。
+
+        抗锯齿、半像素偏移、双三次插值这三项每个 GFX 都要设，少一项线条就毛糙。"""
         self.hdc = hdc                       # 记下 GDI DC，供 GDI 文字渲染/度量用
         self.g = ptr if ptr else P()
         if not ptr:
@@ -599,16 +729,19 @@ class GFX:
         gdip.GdipDeleteGraphics(self.g)
 
     def __enter__(self):
+        """支持 with GFX(dc) as g: 写法，保证异常时也会走 __exit__ 释放"""
         return self
 
     def __exit__(self, exc_type, exc, tb):
         # 异常时也必须释放：否则每帧泄漏一个 GDI+ Graphics + 字体
+        """离开 with 块时释放资源；返回 False 表示异常照常往外抛，不吞掉"""
         self.close()
         return False
 
     def __del__(self):
         # 兜底：绘制中途抛异常时，局部变量 g 离开作用域 → 引用计数归零 →
         # 这里兜住 close()，避免 GDI+ 对象无限累积
+        """兜底释放：绘制中途抛异常、对象被回收时，也不会漏下 GDI+ 句柄"""
         try:
             self.close()
         except Exception:
@@ -616,6 +749,10 @@ class GFX:
 
     # ---------- 裁剪：标注只能落在选区里（画布外的一律裁掉）
     def clip_rect(self, x, y, ww, hh):
+        """限制后续绘制范围（标注不许画出选区）。
+
+        GDI+ 和 GDI 是两套裁剪，必须同时设。只设 GDI+ 的话，由 GDI 画的
+        文字仍然会漏到选区外面。"""
         gdip.GdipSetClipRect(self.g, float(x), float(y),
                              float(max(0.0, ww)), float(max(0.0, hh)), 1)
         # GDI+ 的 clip 只对 GDI+ 绘制生效，这里同步设 GDI 裁剪区，
@@ -636,6 +773,8 @@ class GFX:
         return st.value
 
     def clip_restore(self, st):
+        """恢复 clip_save 时的裁剪状态。clip_rect 是「相交」语义，
+        嵌套裁剪不配对恢复的话，里层画完外层就漏了"""
         gdip.GdipRestoreGraphics(self.g, st)
         stack = getattr(self, "_gdi_stack", [])
         if self.hdc and stack:
@@ -643,11 +782,13 @@ class GFX:
 
     # ---------- 基础图形
     def _brush(self, argb):
+        """建一支纯色画刷。调用方负责 GdipDeleteBrush —— 这里不删"""
         b = P()
         gdip.GdipCreateSolidFill(argb, byref(b))
         return b
 
     def fill(self, argb, x, y, ww, hh):
+        """用纯色填满矩形（alpha 直接参与混合，半透明色点也走这里）"""
         if ww <= 0 or hh <= 0:
             return
         b = self._brush(argb)
@@ -667,6 +808,7 @@ class GFX:
         gdip.GdipDeleteBrush(b)
 
     def fill_circle(self, argb, cx, cy, r):
+        """画实心圆，参数是圆心和半径（箭头头部、颜色圆点用）"""
         if r <= 0:
             return
         b = self._brush(argb)
@@ -674,6 +816,7 @@ class GFX:
         gdip.GdipDeleteBrush(b)
 
     def _path_round(self, x, y, ww, hh, r):
+        """造一个圆角矩形路径。半径会自动夹到不超过短边的一半，不会画出畸形"""
         r = max(0.1, min(r, min(ww, hh) / 2.0))
         p = P()
         gdip.GdipCreatePath(0, byref(p))
@@ -686,6 +829,7 @@ class GFX:
         return p
 
     def fill_round(self, argb, x, y, ww, hh, r):
+        """填充圆角矩形（主面板底、按钮底）"""
         b = self._brush(argb)
         p = self._path_round(x, y, ww, hh, r)
         gdip.GdipFillPath(self.g, b, p)
@@ -693,6 +837,7 @@ class GFX:
         gdip.GdipDeleteBrush(b)
 
     def stroke_round(self, argb, width, x, y, ww, hh, r):
+        """描边圆角矩形（按钮高光边、面板棱边）"""
         pen = P()
         gdip.GdipCreatePen1(argb, width, 0, byref(pen))
         p = self._path_round(x, y, ww, hh, r)
@@ -701,6 +846,7 @@ class GFX:
         gdip.GdipDeletePen(pen)
 
     def line(self, argb, width, x1, y1, x2, y2, cap=0):
+        """画一条直线。cap 可指定端点形状（圆头 / 平头），箭头杆要用圆头"""
         pen = P()
         gdip.GdipCreatePen1(argb, width, 0, byref(pen))
         if cap:
@@ -709,8 +855,32 @@ class GFX:
         gdip.GdipDrawLine(self.g, pen, x1, y1, x2, y2)
         gdip.GdipDeletePen(pen)
 
+    def stroke_box(self, argb, width, x, y, ww, hh):
+        """直角矩形描边。走路径而不是四条线：四条线在四个角上会露缝"""
+        pen = P()
+        gdip.GdipCreatePen1(argb, width, 0, byref(pen))
+        p = P()
+        gdip.GdipCreatePath(0, byref(p))
+        gdip.GdipAddPathRectangle(p, float(x), float(y),
+                                  float(max(0.0, ww)), float(max(0.0, hh)))
+        gdip.GdipDrawPath(self.g, pen, p)
+        gdip.GdipDeletePath(p)
+        gdip.GdipDeletePen(pen)
+
+    def stroke_ellipse(self, argb, width, x, y, ww, hh):
+        """画椭圆描边（圆形标注用）"""
+        pen = P()
+        gdip.GdipCreatePen1(argb, width, 0, byref(pen))
+        gdip.GdipDrawEllipse(self.g, pen, float(x), float(y),
+                             float(max(0.0, ww)), float(max(0.0, hh)))
+        gdip.GdipDeletePen(pen)
+
     # ---------- 文字
     def _font(self, size_px, bold, fam=None):
+        """按 (字号, 粗体, 字体名) 取字体对象，取过就复用。
+
+        每帧新建字体会让 GDI+ 句柄一直涨。字体名按 微软雅黑UI → 雅黑 →
+        Segoe UI 依次回退，某些系统缺字体时不至于一个字都画不出来。"""
         key = (round(size_px, 2), bool(bold), fam)
         f = self._fonts.get(key)
         if f is not None:
@@ -734,6 +904,10 @@ class GFX:
 
     def text(self, s, size_px, argb, x, y, ww, hh, align=0, bold=False,
              valign=1, fam=None, nowrap=False):
+        """在矩形区域内画文字。
+
+        nowrap=True 时强制不换行也不裁剪 —— "马赛克" 这种三字标签在窄按钮里
+        才不会被折成两行或切掉半个字。"""
         fnt = self._font(size_px, bold, fam)
         br = self._brush(argb)
         fmt = P()
@@ -749,6 +923,7 @@ class GFX:
         gdip.GdipDeleteBrush(br)
 
     def measure(self, s, size_px, bold=False, fam=None):
+        """量一段文字占多宽多高。按钮宽度、提示条宽度都靠它算"""
         fnt = self._font(size_px, bold, fam)
         fmt = P()
         gdip.GdipCreateStringFormat(0, 0, byref(fmt))
@@ -780,6 +955,7 @@ def _new_dib(sdc, ww, hh):
 
 
 def _free_dib(d):
+    """释放 _new_dib 造出来的那组句柄。容错：重复释放不会炸"""
     dc, bmp, old, bits = d
     try:
         if dc and old:
@@ -818,6 +994,10 @@ def grab_screen(x, y, ww, hh):
 
 
 def buf_to_image(buf, ww, hh):
+    """把 BGRA 缓冲包成 GDI+ 位图。
+
+    不拷贝像素，只接管指针 —— 调用方必须一直持有这块缓冲，否则会读到已
+    释放的内存（随机崩溃）。"""
     img = P()
     # 0x00022009 = PixelFormat32bppRGB，忽略 alpha 通道
     gdip.GdipCreateBitmapFromScan0(ww, hh, ww * 4, 0x00022009, buf, byref(img))
@@ -837,6 +1017,7 @@ def make_dib(bgra, ww, hh):
 
 
 def struct_pack(ww, hh, size):
+    """拼 CF_DIB 需要的 BITMAPINFOHEADER（复制到剪贴板用）"""
     import struct
     return struct.pack("<IiiHHIIiiII", 40, ww, hh, 1, 32, 0, size, 0, 0, 0, 0)
 
@@ -851,6 +1032,7 @@ _ACC_REL = WINFUNCTYPE(c_ulong, c_void_p)
 
 
 def _cloaked(hwnd):
+    """窗口是否被 DWM 隐藏（UWP 应用切到后台会“隐身”，但仍在窗口列表里）"""
     v = w.DWORD(0)
     hr = dwmapi.DwmGetWindowAttribute(hwnd, 14, byref(v), sizeof(v))
     return hr == 0 and v.value != 0
@@ -918,6 +1100,7 @@ class Probe(threading.Thread):
     """
 
     def __init__(self):
+        """只初始化状态，线程在 start() 之后才真正跑起来"""
         threading.Thread.__init__(self, daemon=True)
         self._lock = threading.Lock()
         self._req = None
@@ -926,16 +1109,21 @@ class Probe(threading.Thread):
         self.ready = False
 
     def request(self, sx, sy):
+        """投一次查询，返回递增序号（用来丢掉过期结果）"""
         with self._lock:
             self._seq += 1
             self._req = (sx, sy, self._seq)
         return self._seq
 
     def latest(self):
+        """取最近一次查询结果，格式 (矩形或 None, 序号)"""
         with self._lock:
             return self._res
 
     def run(self):
+        """线程主循环：有请求就查一次 UI 元素矩形，没有就睡 15ms。
+
+        查不到不算错，调用方会退回「按窗口」识别。"""
         try:
             ole32.CoInitializeEx(None, 2)      # STA
             self.ready = True
@@ -960,7 +1148,45 @@ class Probe(threading.Thread):
 
 # ============================================================ 主程序
 class App:
+    """程序主体：三个窗口 + 一个托盘图标，全部状态都挂在这个对象上。
+
+    三个窗口各管一段：
+      · hwnd_main     主面板 —— 液态玻璃、自己接管拖动
+      · hwnd_overlay  全屏遮罩 —— 截图时盖住屏幕，承载选区、标注、提示条
+      · hwnd_tool     浮动工具条 —— 截图后出现在选区下方
+
+    下面 146 个方法按职责分成八段，搜索「=== N.」可以直接跳到第 N 段开头：
+      1. 基础设施        DPI 换算、光标、GDI+ 启动、窗口类注册
+      2. 全局快捷键      注册 / 录制 / 组合被占用时的回退
+      3. 主面板          窗口创建、离屏呈现、玻璃背景、自接管拖动、绘制
+      4. 截图流程        遮罩创建、抓屏、离屏缓冲、悬停自动识别
+      5. 遮罩合成与标注  整帧合成，以及画笔 / 马赛克 / 箭头 / 方框 / 圆形
+      6. 遮罩交互        消息分派、选区拖拽改大小、标注状态与撤销栈
+      7. 浮动工具条      版式、毛玻璃底、按钮绘制、点击派发
+      8. 成品输出与系统  复制 / 保存 / 托盘 / 开机启动 / 消息循环
+    """
+
+    # ================================================== 1. 基础设施 —— DPI / 光标 / GDI+ / 窗口类
     def __init__(self):
+        """初始化全部状态 —— 本身只按顺序调 9 个 _init_*，不直接赋值。
+
+        分组原则：一块状态一个 _init_*，出问题一眼能看出是哪块没初始化。
+        缓冲一律先置 None、用到才建（见 _ensure_*_surface），启动时不占几十 MB。"""
+        self._init_env()             # 进程句柄 / DPI / 虚拟屏 / 面板尺寸
+        self._init_windows()         # 三个窗口句柄 + 托盘图标数据
+        self._init_hotkey()          # 全局热键与录制状态
+        self._init_capture_state()   # 选区、拖动、自动识别线程
+        self._init_anno_state()      # 标注、撤销栈、当前选中
+        self._init_surfaces()        # 离屏缓冲、马赛克缓存、hover
+        self._init_tool_surface()    # 工具条逐像素呈现表面
+        self._init_main_surface()    # 主面板呈现表面 + 拖动玻璃
+        self._init_window_procs()    # 窗口过程、GDI+、窗口类注册
+
+    # ---------- 初始化（按块拆开，见 __init__）
+    def _init_env(self):
+        """进程句柄、DPI 缩放、虚拟屏范围、主面板尺寸。
+
+        px() 依赖 self.scale，所以这个必须最先跑。"""
         self.hinst = windll.kernel32.GetModuleHandleW(None)
         self.scale = 1.0
         try:
@@ -981,19 +1207,25 @@ class App:
         self.MH = self.px(148)
         self.RADIUS = self.px(20)
 
+    def _init_windows(self):
+        """三个窗口的句柄（此时都还没创建）和托盘图标数据结构"""
         self.hwnd_main = None
         self.hwnd_overlay = None
         self.hwnd_tool = None
         self.tray = NOTIFYICONDATAW()
 
-        # 快捷键
+    def _init_hotkey(self):
+        """全局热键组合（读配置）和「正在录制新热键」的临时状态"""
         self.hotkey_mod, self.hotkey_vk = load_config()
         self.hotkey_ok = False
         self.recording = False
         self.rec_msg = ""
         self.rec_err = False
 
-        # 截图状态
+    def _init_capture_state(self):
+        """截图流程状态 + 自动识别。
+
+        Probe 是一个后台线程，启动后一直活着，靠 latest() 取最新识别结果。"""
         self.shot_buf = None
         self.shot_raw = None
         self.sel = None
@@ -1019,9 +1251,13 @@ class App:
         self.probe_pt = (0, 0)
         self.mypid = windll.kernel32.GetCurrentProcessId()
 
-        # 标注（画笔 / 马赛克 / 箭头）
-        self.shapes = []               # [{t:"pen"|"mosaic"|"arrow", ...}]
-        self.mode = None               # None / "pen" / "mosaic" / "arrow"
+    def _init_anno_state(self):
+        """标注数据本身 + 撤销/重做栈 + 当前选中与拖动目标。
+
+        这里只存「画的是什么」；渲染缓存（_mos_cache / _cells_cache）在
+        _init_surfaces 里，两者不要混。"""
+        self.shapes = []               # [{t:"pen"|"mosaic"|"arrow"|"rect"|"ellipse", ...}]
+        self.mode = None               # None / "pen" / "mosaic" / "arrow" / "rect" / "ellipse"
         self.pending = None            # 拖动中的临时标注
         self.draw_start = None
         self.anno_color = 0            # ANNO_COLORS 下标：红蓝绿黄白黑灰（画笔用前六色）
@@ -1036,12 +1272,17 @@ class App:
         self.shape0 = None
         self.drag_end = 0              # 箭头端点拖动：1=起点 2=终点
 
-        # 离屏缓冲（消除闪烁的关键）
+    def _init_surfaces(self):
+        """离屏缓冲（消除闪烁的关键）、马赛克缓存、鼠标 hover 状态。
+
+        缓冲先置 None：真正创建在 _build_capture_buffers / _ensure_*_surface。"""
         self.dc_shot = self.dc_dim = self.dc_back = None
         self.bmp_shot = self.bmp_dim = self.bmp_back = None
         self.hdc_screen = None
         self._sdc = None               # 常驻的屏幕 DC（见 _get_screen_dc）
+        self._excl_ok = None           # 能否「抓屏时排除自己」（见 _can_exclude_from_capture）
         self._mos_cache = {}           # 马赛克块的平均色缓存（每次截图重置）
+        self._cells_cache = {}         # 马赛克笔迹覆盖的网格（见 _stroke_cells）
 
         # 交互 hover 状态
         self.hover_main = None
@@ -1049,7 +1290,8 @@ class App:
         self.tracking_main = False
         self.tracking_tool = False
 
-        # 工具条逐像素呈现表面
+    def _init_tool_surface(self):
+        """悬浮工具条的逐像素呈现表面与毛玻璃底缓存"""
         self.tb_dc = self.tb_bmp = self.tb_old = self.tb_bits = None
         self.tb_size = None
         self.tb_key = None             # 布局签名（模式一换就变，见 _tool_layout_key）
@@ -1057,6 +1299,7 @@ class App:
         self.tb_scale = None
         self.tb_alpha = None
         self.tb_pos = (0, 0)
+
         # 毛玻璃底：缓存「该位置的桌面模糊图 + 按钮形状覆盖率」
         self.tb_glass = None           # 玻璃底 bytes（W×H×4）
         self.tb_glass_key = None       # (x, y, W, H, sel) —— 位置/尺寸/选区变了才重算
@@ -1066,7 +1309,8 @@ class App:
         # False：取遮罩里压暗后的画面（几乎看不出磨砂）。见 tools/preview_tool_glass.py
         self.use_shot_glass = True
 
-        # 主窗口逐像素呈现表面（液态玻璃）
+    def _init_main_surface(self):
+        """主面板的呈现表面（液态玻璃）、截图留底、拖动玻璃状态"""
         self.mn_dc = self.mn_bmp = self.mn_old = self.mn_bits = None
         self.mn_size = None
         # 截图瞬间主窗口那一帧的拷贝 + 窗口在屏幕上的位置：
@@ -1078,6 +1322,7 @@ class App:
         self.mn_glass = None           # 模糊后的桌面底（BGRA 原始字节）
         self.mn_cov = None             # 圆角覆盖率缓存
         self.mn_cov_key = None
+
         # 拖动中的玻璃底来源：一张全屏缩略图。
         # 拖窗时每帧都去抓屏是不行的（抓屏前必须先把自己变透明 → 会闪），
         # 所以改成「拖动开始时抓一整屏、缩到 1/13 存着，之后按新位置从里面裁」。
@@ -1091,9 +1336,17 @@ class App:
         self.main_drag = False
         self.main_drag_off = (0, 0)    # 按下时鼠标相对窗口左上角的偏移
 
-        # 窗口过程统一兜一层异常：ctypes 回调里抛出的异常会被 ctypes 静默吞掉
-        # （只在 stderr 打一行 "Exception ignored"），用户和开发者都看不到现场，
-        # 窗口还会留在半损坏状态。统一接住 → 写日志 → 返回 0。
+        # 玻璃底自动跟随桌面变化（窗口事件钩子 + 低频定时器）
+        self.glass_hook = None
+        self.glass_proc = None         # 回调必须留引用，否则会被 GC 掉
+        self.glass_dirty = False
+
+    def _init_window_procs(self):
+        """窗口过程、光标缓存、GDI+ 与窗口类。
+
+        窗口过程统一兜一层异常：ctypes 回调里抛出的异常会被 ctypes 静默吞掉
+        （只在 stderr 打一行 "Exception ignored"），用户和开发者都看不到现场，
+        窗口还会留在半损坏状态。统一接住 → 写日志 → 返回 0。"""
         self._proc_main = WNDPROC(_safe_proc(self._on_main))
         self._proc_overlay = WNDPROC(_safe_proc(self._on_overlay))
         self._proc_tool = WNDPROC(_safe_proc(self._on_tool))
@@ -1123,14 +1376,34 @@ class App:
         return max(0, min(self.anno_color, len(ANNO_COLORS) - 1))
 
     def px(self, v):
+        """把设计稿上的像素值换算成当前 DPI 下的实际像素。
+
+        所有尺寸都必须过这个函数，125% / 150% 缩放下界面才不会挤成一团。"""
         return int(round(v * self.scale))
 
+    def tb(self, v):
+        """工具条专用尺寸：在 DPI 缩放之外再乘一次整体缩放系数 TB_SCALE。
+
+        工具条有 10 颗按钮，整条比较长。想让它整体大一点小一点，只改 TB_SCALE
+        一个数就行 —— 按钮宽高、图标、字号、圆角、选项排间距会一起等比缩放，
+        不会出现「按钮小了但字还那么大」的错位。"""
+        return self.px(v * TB_SCALE)
+
+    def tb_font(self, v):
+        """工具条里的字号，按 TB_FONT_SCALE 单独缩放（不跟 TB_SCALE 走）。
+
+        外框缩到 0.86 是为了省宽度，但字跟着缩就小了，所以字号只缩到 0.92。
+        改字号只改 TB_FONT_SCALE，按钮宽高不受影响。"""
+        return self.px(v * TB_FONT_SCALE)
+
     def _init_gdiplus(self):
+        """启动 GDI+。必须在任何绘图之前调用一次，否则后面所有 Gdip 调用静默失败"""
         tok = P()
         si = GdiplusStartupInput(1, None, False, False)
         gdip.GdiplusStartup(byref(tok), byref(si), None)
 
     def _load_cursor(self, cid):
+        """取系统自带光标句柄（箭头 / 十字 / 各种缩放箭头）"""
         return user32.LoadCursorW(None, c_void_p(cid))
 
     def _brush_cursor(self):
@@ -1176,26 +1449,25 @@ class App:
             return None
         gimg = P()
         gdip.GdipGetImageGraphicsContext(bmp, byref(gimg))
-        g = GFX(ptr=gimg)
 
         # 黑白双环：外圈黑 + 紧贴其内的白环。白环保证深色底上看得见，
         # 黑边保证浅色底上看得见；两环都不重叠，避免 AA 混成灰糊一片
-        w = max(1.8, r * 0.09)
-        pen = P()
-        gdip.GdipCreatePen1(0xFF0A0A0E, w, 0, byref(pen))
-        gdip.GdipDrawEllipse(g.g, pen, c0 - r, c0 - r, r * 2.0, r * 2.0)
-        gdip.GdipDeletePen(pen)
-        rr = max(1.0, r - w)
-        pen = P()
-        gdip.GdipCreatePen1(0xFFFFFFFF, w, 0, byref(pen))
-        gdip.GdipDrawEllipse(g.g, pen, c0 - rr, c0 - rr, rr * 2.0, rr * 2.0)
-        gdip.GdipDeletePen(pen)
+        with GFX(ptr=gimg) as g:
+            w = max(1.8, r * 0.09)
+            pen = P()
+            gdip.GdipCreatePen1(0xFF0A0A0E, w, 0, byref(pen))
+            gdip.GdipDrawEllipse(g.g, pen, c0 - r, c0 - r, r * 2.0, r * 2.0)
+            gdip.GdipDeletePen(pen)
+            rr = max(1.0, r - w)
+            pen = P()
+            gdip.GdipCreatePen1(0xFFFFFFFF, w, 0, byref(pen))
+            gdip.GdipDrawEllipse(g.g, pen, c0 - rr, c0 - rr, rr * 2.0, rr * 2.0)
+            gdip.GdipDeletePen(pen)
 
-        # 中心点：笔头正中对齐哪里一目了然
-        g.fill_circle(0xFF0A0A0E, c0, c0, 1.9)
-        g.fill_circle(0xFFFFFFFF, c0, c0, 1.0)
+            # 中心点：笔头正中对齐哪里一目了然
+            g.fill_circle(0xFF0A0A0E, c0, c0, 1.9)
+            g.fill_circle(0xFFFFFFFF, c0, c0, 1.0)
 
-        g.close()
         gdip.GdipDisposeImage(bmp)
 
         # 直通 alpha -> 预乘 alpha（系统按预乘解释 32bpp 光标）
@@ -1238,6 +1510,9 @@ class App:
         return hcur
 
     def _register_classes(self):
+        """注册三个窗口类：主面板 / 全屏遮罩 / 浮动工具条。
+
+        遮罩类带 CS_DBLCLKS，双击能直接完成截图。"""
         self.hcur_arrow = self._load_cursor(IDC_ARROW)
         self.hcur_cross = self._load_cursor(IDC_CROSS)
         self.hcur_move = self._load_cursor(IDC_SIZEALL)
@@ -1263,11 +1538,13 @@ class App:
             wc.lpszClassName = name
             user32.RegisterClassExW(byref(wc))
 
-    # ================================================== 快捷键
+    # ================================================== 2. 全局快捷键
     def _hotkey_label(self):
+        """当前快捷键的显示文本"""
         return hotkey_label(self.hotkey_mod, self.hotkey_vk)
 
     def _current_mod(self):
+        """读键盘此刻按住的修饰键（录制快捷键时判断用户按了什么）"""
         mod = 0
         if user32.GetKeyState(VK_CONTROL) & 0x8000:
             mod |= MOD_CONTROL
@@ -1280,11 +1557,13 @@ class App:
         return mod
 
     def _register_hotkey(self):
+        """向系统注册全局热键，返回是否成功（组合被别的软件占用就会失败）"""
         self.hotkey_ok = bool(user32.RegisterHotKey(None, HOTKEY_ID,
                                                     self.hotkey_mod, self.hotkey_vk))
         return self.hotkey_ok
 
     def _begin_record(self):
+        """进入快捷键录制：先注销旧热键，否则按下新组合会先把截图触发了"""
         if self.recording:
             return
         self.recording = True
@@ -1296,6 +1575,7 @@ class App:
         user32.InvalidateRect(self.hwnd_main, None, False)
 
     def _end_record(self):
+        """退出录制，把热键重新注册回去"""
         if not self.recording:
             return
         self.recording = False
@@ -1306,6 +1586,7 @@ class App:
             user32.InvalidateRect(self.hwnd_main, None, False)
 
     def _on_record_key(self, vk):
+        """录制中收到按键：Esc 取消，纯修饰键忽略，其余拿去试注册"""
         if vk == VK_ESCAPE:
             self._end_record()
             return
@@ -1334,6 +1615,7 @@ class App:
         self._balloon("快捷键已更新", self._hotkey_label())
 
     def _try_hotkey(self, mod, vk):
+        """试注册一个组合。失败就恢复原来的那个，不会把用户的快捷键弄丢"""
         user32.UnregisterHotKey(None, HOTKEY_ID)
         if user32.RegisterHotKey(None, HOTKEY_ID, mod, vk):
             return True
@@ -1341,24 +1623,29 @@ class App:
         user32.RegisterHotKey(None, HOTKEY_ID, self.hotkey_mod, self.hotkey_vk)
         return False
 
-    # ================================================== 主面板
+    # ================================================== 3. 主面板 —— 窗口 / 玻璃背景 / 拖动 / 绘制
     def create_main(self):
+        """建主面板窗口并上屏。
+
+        先把背后的真实桌面抓成玻璃底再显示，否则会先黑一下再变玻璃。"""
         sw = user32.GetSystemMetrics(0)
         sh = user32.GetSystemMetrics(1)
         x = (sw - self.MW) // 2
         y = max(0, (sh - self.MH) // 2 - self.px(60))
         self.hwnd_main = user32.CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, "SnapLiteMain", APP_NAME,
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED, "SnapLiteMain", APP_NAME,
             WS_POPUP, x, y, self.MW, self.MH, None, None, self.hinst, None)
         if not self.hwnd_main:
             return
         # 先把背后的真实桌面抓下来做成玻璃底，再上屏 —— 避免先黑一下再变玻璃
         self._refresh_glass(blank=False)
         user32.ShowWindow(self.hwnd_main, SW_SHOW)
+        self._watch_desktop()
         dbg("create_main hwnd=%s visible=%s" % (self.hwnd_main,
                                                 user32.IsWindowVisible(self.hwnd_main)))
 
     def _main_layout(self):
+        """算主面板上几个控件的矩形：关闭、收到托盘、截图按钮、快捷键行"""
         W, H = self.MW, self.MH
         sz = self.px(26)
         gap = self.px(4)
@@ -1372,6 +1659,10 @@ class App:
 
     # ---------- 液态玻璃：主窗口用逐像素 alpha 分层表面
     def _paint_main(self, hwnd):
+        """响应 WM_PAINT。
+
+        整窗都是我们自己画的，这里只清掉重绘请求再提交一帧，不做任何绘制
+        （重画由 _present_main 负责，避免两条路径画出两种样子）。"""
         ps = PAINTSTRUCT()
         user32.BeginPaint(hwnd, byref(ps))
         user32.EndPaint(hwnd, byref(ps))
@@ -1394,6 +1685,7 @@ class App:
         return self._sdc
 
     def _release_screen_dc(self):
+        """释放常驻的屏幕 DC（退出时调一次）"""
         if self._sdc:
             try:
                 user32.ReleaseDC(None, self._sdc)
@@ -1402,6 +1694,7 @@ class App:
             self._sdc = None
 
     def _ensure_main_surface(self):
+        """确保主面板的离屏表面存在、且尺寸与当前 DPI 一致"""
         W, H = self.MW, self.MH
         if self.mn_dc and self.mn_size == (W, H):
             return
@@ -1411,6 +1704,7 @@ class App:
         self.mn_size = (W, H)
 
     def _release_main_surface(self):
+        """释放主面板表面和那份留底拷贝"""
         if self.mn_dc:
             _free_dib((self.mn_dc, self.mn_bmp, self.mn_old, self.mn_bits))
             self.mn_dc = None
@@ -1454,14 +1748,16 @@ class App:
         self._blit_main()
 
     def _present_main(self, dst=None):
+        """把主面板当前状态合成一帧提交到屏幕。
+
+        glass 是模糊过的桌面底；抓不到桌面就退化成实底，保证文字一定看得清。"""
         if not self.hwnd_main:
             return
         self._ensure_main_surface()
         W, H = self.mn_size
         total = W * H * 4
         ctypes.memset(self.mn_bits, 0, total)
-        g = GFX(self.mn_dc)
-        try:
+        with GFX(self.mn_dc) as g:
             glass = self.mn_glass
             if glass and len(glass) == total:
                 ctypes.memmove(self.mn_bits, glass, total)
@@ -1469,8 +1765,6 @@ class App:
                 # 抓不到桌面时退化成实底，保证文字一定可读
                 g.fill_round(0xFF14161A, 0, 0, W, H, self.RADIUS)
             self._draw_main(g, W, H)
-        finally:
-            g.close()
         self._apply_round_mask(W, H)
         self._blit_main(dst)
 
@@ -1555,13 +1849,213 @@ class App:
             self.mn_glass = None
         self._present_main()
 
+    # ---------- 玻璃底自动跟随桌面变化
+    def _watch_desktop(self):
+        """装一个窗口事件钩子：别的窗口移动 / 显示 / 隐藏 / 切换前台时打个标记。
+
+        以前玻璃底只在「自己动了」或「主动重绘」时重算，别的窗口在下面挪，
+        背景就一直停在旧画面。钩子只负责置位，真正的重活留给定时器，
+        免得一次拖动几百个事件把主线程堵死。"""
+        try:
+            self.glass_proc = WINEVENTPROC(self._on_desktop_event)
+            self.glass_hook = user32.SetWinEventHook(
+                EVENT_SYSTEM_FOREGROUND, EVENT_OBJECT_LOCATIONCHANGE,
+                None, self.glass_proc, 0, 0,
+                WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)
+            if not self.glass_hook:
+                dbg("SetWinEventHook 失败，玻璃底不会自动跟随")
+        except Exception as e:
+            dbg("SetWinEventHook 异常: %r" % (e,))
+        user32.SetTimer(self.hwnd_main, TIMER_GLASS, GLASS_TICK_MS, None)
+
+    def _on_desktop_event(self, hook, event, hwnd, idobj, idchild, thread, ms):
+        # 处在截图流程里时不需要跟（遮罩盖着，主面板也停在透明帧）
+        """桌面窗口事件回调。
+
+        只置一个标记就走，绝不在这里干重活 —— 拖动一个窗口会瞬间产生几百个
+        事件，每个都重算玻璃底会把界面卡死。真正重算交给定时器（_tick_glass）。"""
+        if not self.capturing:
+            self.glass_dirty = True
+        return None
+
+    def _tick_glass(self):
+        """定时器：桌面变过就重算一次玻璃底（空闲时一帧都不多算）"""
+        if not self.glass_dirty:
+            return
+        self.glass_dirty = False
+        if (not self.hwnd_main or self.capturing or self.main_drag
+                or self.drag_active or self.recording):
+            return
+        if not user32.IsWindowVisible(self.hwnd_main):
+            return
+        if user32.IsIconic(self.hwnd_main):
+            return
+        self._refresh_glass_live()
+
+    def _can_exclude_from_capture(self):
+        """当前系统能不能「抓屏时把自己排除掉」（Win10 2004 / build 19041 起）。
+
+        更早的系统上 WDA_EXCLUDEFROMCAPTURE 会被当成「遮蔽」处理，抓到的
+        是一片黑 —— 比不支持更糟。所以按真实 build 号判断，不支持就走
+        旧的插值路径。结果只算一次。"""
+        if self._excl_ok is None:
+            self._excl_ok = win_build() >= CAPTURE_EXCLUDE_MIN_BUILD
+        return self._excl_ok
+
+    def _looks_like_self(self, raw, ww, hh):
+        """这次抓回来的画面，是不是「面板自己」（说明排除属性没赶上这一帧）。
+
+        只比中间 60% 一块：边缘可能掺进邻接的背景，中间那块一定被面板盖着。
+        阈值 8 是实测出来的：排除成功时与面板差 79，抓到面板本身时只有 0~5。
+        判据拿不到面板像素时返回 False（当作成功），不因为校验本身失败而卡住。"""
+        if not self.mn_bits or self.mn_size != (ww, hh):
+            return False
+        try:
+            mine = ctypes.string_at(self.mn_bits, ww * hh * 4)
+        except Exception:
+            return False
+        x0, x1 = ww // 5, ww * 4 // 5
+        y0, y1 = hh // 5, hh * 4 // 5
+        tot = cnt = 0
+        for y in range(y0, y1, 4):
+            for x in range(x0, x1, 4):
+                o = (y * ww + x) * 4
+                tot += (abs(raw[o] - mine[o]) + abs(raw[o + 1] - mine[o + 1])
+                        + abs(raw[o + 2] - mine[o + 2]))
+                cnt += 3
+        return bool(cnt) and (tot / float(cnt)) < 8.0
+
+    def _grab_without_self(self, left, top, ww, hh):
+        """抓 (left, top) 处 ww×hh —— 画面里不含本窗口。失败返回 None。
+
+        只在抓的这一小段里把窗口标成「抓屏时排除」，抓完立刻恢复：这个属性
+        对系统里所有抓屏程序都生效，不能常驻，否则别的截图工具也拍不到它。
+
+        为什么要重试：DWM 是异步合成的，设置属性后偶尔会「这一帧还没生效」，
+        BitBlt 拿到的仍是面板自己（实测十次里会碰上一两次）。所以抓完先看
+        一眼像不像自己，像就等 DWM 刷一帧再抓一次。第一次不等，是因为多数
+        时候本来就已经生效，白等一帧要多花 16ms。"""
+        for attempt in range(2):
+            raw = None
+            try:
+                user32.SetWindowDisplayAffinity(self.hwnd_main, WDA_EXCLUDEFROMCAPTURE)
+                try:
+                    if attempt:
+                        try:
+                            dwmapi.DwmFlush()      # 等这一帧把面板从合成里摘掉
+                        except Exception:
+                            pass
+                    raw = grab_screen(left, top, ww, hh).raw
+                finally:
+                    user32.SetWindowDisplayAffinity(self.hwnd_main, WDA_NONE)
+            except Exception as e:
+                dbg("grab without self failed: %r" % (e,))
+                return None
+            if raw and len(raw) == ww * hh * 4 and not self._looks_like_self(raw, ww, hh):
+                return raw
+        dbg("抓背景两次都抓到自己，改用插值路径")
+        return None
+
+    def _live_glass_excluded(self, W, H):
+        """走「排除自己」这条路：抓到的是背后的真实桌面，模糊一下就能用。
+
+        实测与「面板透明后直抓」逐像素差 0.1，耗时不到 5ms（旧的插值路径要
+        13ms，而且中间内容是假的）。"""
+        rc = w.RECT()
+        user32.GetWindowRect(self.hwnd_main, byref(rc))
+        raw = self._grab_without_self(rc.left, rc.top, W, H)
+        if not raw or len(raw) != W * H * 4:
+            return None
+        try:
+            return self._blur_bgra(raw, W, H)
+        except Exception as e:
+            dbg("live glass blur failed: %r" % (e,))
+            return None
+
+    def _live_glass_patched(self, W, H):
+        """老系统的退路：抓窗口周围一大圈，把自己占的那几格用左右插值补掉。
+
+        注意这条路的画面**中间是推算出来的**：面板在缩略图里约占 76% 的宽度，
+        补出来是一道水平渐变，背后的真实内容会丢（实测与真背景差 ±36 亮度）。
+        只在没有 WDA_EXCLUDEFROMCAPTURE 的系统上才用。"""
+        rc = w.RECT()
+        user32.GetWindowRect(self.hwnd_main, byref(rc))
+        f = self.BLUR_F
+        pad = f * 4                       # 四周多留几格，放大时才有余量
+        gx, gy = rc.left - pad, rc.top - pad
+        gw, gh = W + pad * 2, H + pad * 2
+        sw, sh = max(2, gw // f), max(2, gh // f)
+
+        small = None
+        try:
+            d = _new_dib(self._get_screen_dc(), sw, sh)
+            try:
+                gdi32.SetStretchBltMode(d[0], 4)          # HALFTONE
+                if gdi32.StretchBlt(d[0], 0, 0, sw, sh,
+                                    self._get_screen_dc(), gx, gy, gw, gh, SRCCOPY):
+                    small = ctypes.string_at(d[3], sw * sh * 4)
+            finally:
+                _free_dib(d)
+        except Exception as e:
+            dbg("live glass grab failed: %r" % (e,))
+        if not small or len(small) != sw * sh * 4:
+            return None
+
+        small = self._patch_own_window(small, sw, sh, gx, gy, gw, gh)
+
+        # 借用拖动那条取块路径：临时把它当成「以这块区域为全屏」来算
+        keep = (self.vs, self.drag_small, self.drag_small_size,
+                self.drag_scale, self.drag_active)
+        try:
+            self.vs = (gx, gy, gw, gh)
+            self.drag_small = small
+            self.drag_small_size = (sw, sh)
+            self.drag_scale = (gw / float(sw), gh / float(sh))
+            self.drag_active = True
+            return self._drag_glass_bytes(rc.left, rc.top)
+        except Exception as e:
+            dbg("live glass failed: %r" % (e,))
+            return None
+        finally:
+            (self.vs, self.drag_small, self.drag_small_size,
+             self.drag_scale, self.drag_active) = keep
+
+    def _refresh_glass_live(self):
+        """重取一张「背后的桌面」，重算玻璃底，位置一个像素都不动。
+
+        难点：自己正盖在要抓的那块上，直接抓会抓到自己（自我递归的糊）。
+        三种做法都试过：
+
+        1. 先提交全透明帧、等 DWM 合成再抓 —— 40~50ms，而且能看见面板闪
+           一下；放进 11fps 的自动刷新里就是持续闪。只用于首次建底。
+        2. 抓一大圈、把自己占的那几格用左右像素插值补掉 —— 快，但中间是
+           推出来的：面板在缩略图里占 76% 的宽度，补出来一道水平渐变，背
+           后的内容全丢（实测差 ±36 亮度）。现在只当老系统的退路。
+        3. **SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)** —— 告诉
+           DWM「抓屏时把我当不存在」，屏幕上照常显示，抓回来直接就是背后
+           的真实桌面。实测与「透明后直抓」差 0.1，代价 < 5ms。
+
+        默认走第 3 条，Win10 2004 之前的系统退回第 2 条。"""
+        if not self.hwnd_main:
+            return
+        W, H = self.MW, self.MH
+        glass = None
+        if self._can_exclude_from_capture():
+            glass = self._live_glass_excluded(W, H)
+        if not glass:                    # 老系统，或这一帧没排除成功
+            glass = self._live_glass_patched(W, H)
+        if glass:
+            self.mn_glass = glass
+            self._present_main()
+
+
     def _blur_bgra(self, raw, W, H):
         """缩到 1/f 再用 GDI+ 双三次插值放回来 → 平滑模糊（零第三方依赖）
 
         注意：不能用 GDI 的 StretchBlt + HALFTONE，32bpp 目标下会退化成
         最近邻，放大会出现明显马赛克方块。"""
         sdc = self._get_screen_dc()
-        f = 13
+        f = self.BLUR_F
         sw, sh = max(2, W // f), max(2, H // f)
         made = []
         imgs = []
@@ -1572,17 +2066,15 @@ class App:
 
             small = _new_dib(sdc, sw, sh)
             made.append(small)
-            g1 = GFX(small[0])
             img = P()
             gdip.GdipCreateBitmapFromScan0(W, H, W * 4, 0x00022009, src[3], byref(img))
             imgs.append(img)
-            gdip.GdipDrawImageRectI(g1.g, img, 0, 0, sw, sh)
-            g1.close()
+            with GFX(small[0]) as g1:
+                gdip.GdipDrawImageRectI(g1.g, img, 0, 0, sw, sh)
 
             raw_small = ctypes.string_at(small[3], sw * sh * 4)
             out = _new_dib(sdc, W, H)
             made.append(out)
-            g2 = GFX(out[0])
             img2 = P()
             # 注意：GdipCreateBitmapFromScan0 不拷贝像素，只接管指针。
             # 这里必须用变量持有这块缓冲，否则它被回收后 GDI+ 仍然去读 → 随机崩溃。
@@ -1590,8 +2082,8 @@ class App:
             gdip.GdipCreateBitmapFromScan0(sw, sh, sw * 4, 0x00022009,
                                            hold, byref(img2))
             imgs.append(img2)
-            gdip.GdipDrawImageRectI(g2.g, img2, 0, 0, W, H)
-            g2.close()
+            with GFX(out[0]) as g2:
+                gdip.GdipDrawImageRectI(g2.g, img2, 0, 0, W, H)
             data = bytearray(ctypes.string_at(out[3], W * H * 4))
         finally:
             for im in imgs:
@@ -1697,6 +2189,7 @@ class App:
             return small
 
     def _end_drag_glass(self):
+        """拖动结束：丢掉缩略图，下次拖动重新抓"""
         self.drag_active = False
         self.drag_small = None
         self.drag_small_size = None
@@ -1729,12 +2222,9 @@ class App:
 
         sdc = self._get_screen_dc()
         out = _new_dib(sdc, W, H)
-        g = GFX(out[0])
-        try:
+        with GFX(out[0]) as g:
             # 先铺实底：越界区域和裁剪偏差都靠它兜住，不会透出桌面
             g.fill(0xFF14161A, 0, 0, W, H)
-        finally:
-            g.close()
 
         if x1 > x0 and y1 > y0:
             ew, eh = x1 - x0, y1 - y0
@@ -1752,20 +2242,19 @@ class App:
             src = _new_dib(sdc, ew, eh)
             big = _new_dib(sdc, bw, bh)
             img = P()
-            gb = GFX(big[0])
-            try:
-                ctypes.memmove(src[3], bytes(crop), ew * eh * 4)
-                gdip.GdipCreateBitmapFromScan0(ew, eh, ew * 4, 0x00022009,
-                                               src[3], byref(img))
-                gdip.GdipDrawImageRectI(gb.g, img, 0, 0, bw, bh)
-            finally:
-                gb.close()
-                if img:
-                    try:
-                        gdip.GdipDisposeImage(img)
-                    except Exception:
-                        pass
-                _free_dib(src)
+            with GFX(big[0]) as gb:
+                try:
+                    ctypes.memmove(src[3], bytes(crop), ew * eh * 4)
+                    gdip.GdipCreateBitmapFromScan0(ew, eh, ew * 4, 0x00022009,
+                                                   src[3], byref(img))
+                    gdip.GdipDrawImageRectI(gb.g, img, 0, 0, bw, bh)
+                finally:
+                    if img:
+                        try:
+                            gdip.GdipDisposeImage(img)
+                        except Exception:
+                            pass
+                    _free_dib(src)
 
             # 亚像素补偿：窗口相对这块放大图偏了多少整数屏幕像素，就往回贴多少。
             # 以前这里把位置 round 到缩略图整格，导致「每走 13px 背景才跳一次」，
@@ -1830,6 +2319,7 @@ class App:
         user32.SetCapture(self.hwnd_main)
 
     def _move_main_drag(self):
+        """拖动中：按鼠标位置算目标坐标并画一帧"""
         if not self.main_drag:
             return
         p = w.POINT()
@@ -1838,6 +2328,7 @@ class App:
                          p.y - self.main_drag_off[1])
 
     def _end_main_drag(self):
+        """结束拖动：放掉鼠标捕获、清掉缩略图"""
         if not self.main_drag:
             return
         self.main_drag = False
@@ -1894,6 +2385,10 @@ class App:
         ctypes.memmove(self.mn_bits, bytes(buf), W * H * 4)
 
     def _draw_main(self, g, W, H):
+        """画主面板的全部内容。
+
+        玻璃底（模糊桌面）已经垫在最下面，这里只叠：压暗层 → 顶部高光 →
+        棱边 → 文字与按钮。"""
         R = self.RADIUS
         # 液态玻璃：模糊过的桌面已经垫在下面，这里只叠「压暗层 + 受光高光 + 棱边」
         g.fill_round(0x80101217, 0, 0, W, H, R)
@@ -1979,6 +2474,11 @@ class App:
                    hot[0] + hot[2] - self.px(84), hot[1], self.px(72), hot[3], 2)
 
     def _on_main(self, hwnd, msg, wp, lp):
+        """主面板窗口过程 —— 只做分派，具体动作在下面的 _main_* 方法里。
+
+        以前这里是 97 行、34 个分支的 if 链：想改「点 ✕ 干什么」得先通读全文。
+        现在按输入类别拆成 5 个方法（键 / 移动 / 离开 / 按下 / 抬起 / 丢捕获），
+        和 _on_overlay 同一个套路 —— 一次交互 = 一个方法。"""
         if msg == WM_PAINT:
             self._paint_main(hwnd)
             return 0
@@ -1991,90 +2491,128 @@ class App:
         if msg == WM_TRAY:
             self._on_tray_msg(lp)
             return 0
+        if msg == WM_TIMER:
+            if wp == TIMER_GLASS:
+                self._tick_glass()
+            return 0
         if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
-            if self.recording:
-                self._on_record_key(wp)
-                return 0
-            if wp == VK_ESCAPE:
+            if self._main_key(wp):
                 return 0
         if msg == WM_ACTIVATE:
             if (wp & 0xFFFF) == 0 and self.recording:
                 self._end_record()
             return 0
         if msg == WM_MOUSEMOVE:
-            if self.main_drag:
-                self._move_main_drag()
-                return 0
-            x, y = lo(lp), hi(lp)
-            close, hide, btn, hot = self._main_layout()
-            hot_id = None
-            if self._in(x, y, close):
-                hot_id = "close"
-            elif self._in(x, y, hide):
-                hot_id = "hide"
-            elif self._in(x, y, btn):
-                hot_id = "btn"
-            elif self._in(x, y, hot):
-                hot_id = "hot"
-            if hot_id != self.hover_main:
-                self.hover_main = hot_id
-                user32.InvalidateRect(hwnd, None, False)
-            if not self.tracking_main:
-                self.tracking_main = True
-                tme = TRACKMOUSEEVENT(sizeof(TRACKMOUSEEVENT), 2, hwnd, 0)
-                user32.TrackMouseEvent(byref(tme))
+            self._main_mouse_move(hwnd, lp)
             return 0
         if msg == WM_MOUSELEAVE:
-            self.tracking_main = False
-            if self.hover_main is not None:
-                self.hover_main = None
-                user32.InvalidateRect(hwnd, None, False)
+            self._main_mouse_leave(hwnd)
             return 0
         if msg == WM_LBUTTONDOWN:
-            x, y = lo(lp), hi(lp)
-            close, hide, btn, hot = self._main_layout()
-            if self._in(x, y, close):
-                # ✕ 只收进托盘，不退出；退出走托盘右键菜单
-                user32.ShowWindow(hwnd, SW_HIDE)
-                return 0
-            if self._in(x, y, hide):
-                user32.ShowWindow(hwnd, SW_HIDE)
-                return 0
-            if self._in(x, y, hot):
-                if self.recording:
-                    self._end_record()
-                else:
-                    self._begin_record()
-                return 0
-            if self._in(x, y, btn):
-                self.start_capture()
-                return 0
-            if self.recording:
-                self._end_record()
-                return 0
-            # 空白处可拖动窗口（自己接管，位置与背景同帧提交，见 _drag_frame）
-            self._start_main_drag()
+            self._main_click(hwnd, lp)
             return 0
         if msg == WM_LBUTTONUP:
-            if self.main_drag:
-                self._move_main_drag()     # 抬手那一下先对齐到最终位置
-                self._end_main_drag()
+            if self._main_release():
                 return 0
         if msg == WM_CAPTURECHANGED:
-            # 捕获被系统或别的窗口抢走（Alt+Tab、弹窗…）→ 立刻收尾，
-            # 否则窗口会一直黏在鼠标上
-            if self.main_drag:
-                self._end_main_drag()
+            if self._main_capture_lost():
                 return 0
         if msg == WM_DESTROY:
             user32.PostQuitMessage(0)
             return 0
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
+    def _main_hit(self, x, y):
+        """(x, y) 落在主面板哪个可交互元素上：close / hide / btn / hot / None"""
+        close, hide, btn, hot = self._main_layout()
+        if self._in(x, y, close):
+            return "close"
+        if self._in(x, y, hide):
+            return "hide"
+        if self._in(x, y, btn):
+            return "btn"
+        if self._in(x, y, hot):
+            return "hot"
+        return None
+
+    def _main_key(self, wp):
+        """按键：录制热键时收下这一键，否则吃掉 Esc。
+
+        返回 True = 已处理（调用方直接 return 0）；False = 交给系统默认处理。"""
+        if self.recording:
+            self._on_record_key(wp)
+            return True
+        return wp == VK_ESCAPE
+
+    def _main_mouse_move(self, hwnd, lp):
+        """鼠标移动：正在拖窗口就只移动窗口，否则只更新高亮元素"""
+        if self.main_drag:
+            self._move_main_drag()
+            return
+        x, y = lo(lp), hi(lp)
+        hot_id = self._main_hit(x, y)
+        if hot_id != self.hover_main:
+            self.hover_main = hot_id
+            user32.InvalidateRect(hwnd, None, False)
+        if not self.tracking_main:
+            # 不开 TrackMouseEvent 就收不到 WM_MOUSELEAVE，高亮会一直留着
+            self.tracking_main = True
+            tme = TRACKMOUSEEVENT(sizeof(TRACKMOUSEEVENT), 2, hwnd, 0)
+            user32.TrackMouseEvent(byref(tme))
+
+    def _main_mouse_leave(self, hwnd):
+        """鼠标移出面板：清掉高亮，否则按钮会一直亮着"""
+        self.tracking_main = False
+        if self.hover_main is not None:
+            self.hover_main = None
+            user32.InvalidateRect(hwnd, None, False)
+
+    def _main_click(self, hwnd, lp):
+        """左键按下：✕/— 收进托盘、热键条开始录制、截图按钮开拍、空白拖动窗口"""
+        x, y = lo(lp), hi(lp)
+        where = self._main_hit(x, y)
+        if where in ("close", "hide"):
+            # ✕ 只收进托盘，不退出；退出走托盘右键菜单
+            user32.ShowWindow(hwnd, SW_HIDE)
+            return
+        if where == "hot":
+            if self.recording:
+                self._end_record()
+            else:
+                self._begin_record()
+            return
+        if where == "btn":
+            self.start_capture()
+            return
+        if self.recording:
+            self._end_record()
+            return
+        # 空白处可拖动窗口（自己接管，位置与背景同帧提交，见 _drag_frame）
+        self._start_main_drag()
+
+    def _main_release(self):
+        """左键抬起：结束窗口拖动。返回 True = 已处理，False = 放给系统"""
+        if not self.main_drag:
+            return False
+        self._move_main_drag()     # 抬手那一下先对齐到最终位置
+        self._end_main_drag()
+        return True
+
+    def _main_capture_lost(self):
+        """鼠标捕获被系统或别的窗口抢走（Alt+Tab、弹窗…）→ 立刻收尾。
+
+        不收回来的话窗口会一直黏在鼠标上。返回 True = 已处理。"""
+        if not self.main_drag:
+            return False
+        self._end_main_drag()
+        return True
+
     def _in(self, x, y, rect):
+        """点是否落在矩形内。矩形是 (x, y, w, h) 这种四元组"""
         return rect[0] <= x < rect[0] + rect[2] and rect[1] <= y < rect[1] + rect[3]
 
     def _show_panel(self):
+        """从托盘把主面板叫回来，并重抓一次玻璃底（藏在托盘期间桌面可能变了）"""
         if not self.hwnd_main:
             return
         # 从托盘唤回时重抓玻璃底：藏在托盘期间桌面可能已经变了
@@ -2083,8 +2621,12 @@ class App:
         user32.SetForegroundWindow(self.hwnd_main)
         user32.InvalidateRect(self.hwnd_main, None, False)
 
-    # ================================================== 截图流程
+    # ================================================== 4. 截图流程 —— 遮罩 / 抓屏 / 缓冲 / 自动识别
     def start_capture(self):
+        """开始截图（托盘、热键、面板按钮都走这里）。
+
+        外面包一层异常兜底：中途任何一步失败都要把界面复原，不能把主窗口
+        永久留在透明帧上 —— 1.1.0 就有这个 bug，截图失败后界面再也回不来。"""
         if self.capturing:
             return
         # 拖动中途被热键打断时，鼠标捕获还挂在主窗口上 —— 不先收尾的话，
@@ -2115,6 +2657,11 @@ class App:
                 self._present_main()      # 开头提交过一帧全透明，这里必须画回来
 
     def _begin_capture(self):
+        """截图的准备阶段：留底主界面 → 提交透明帧 → 抓屏建缓冲 → 显示遮罩。
+
+        关键点：主窗口保持“可见”状态但内容全透明，靠遮罩里的副本顶替显示。
+        这样它既不会被抓进截图，也不会被整屏遮罩盖住（以前置顶的写法会出现
+        “不管有没有框到都不变灰”和“点工具后主界面消失”）。"""
         if self.recording:
             self._end_record()
         self.main_was_visible = bool(self.hwnd_main and user32.IsWindowVisible(self.hwnd_main))
@@ -2203,6 +2750,9 @@ class App:
 
     # ---------- 离屏缓冲
     def _build_capture_buffers(self):
+        """抓一张整屏，造出三套缓冲：shot 原图 / dim 压暗 / back 呈现。
+
+        压暗层在这里一次算好，之后每帧只做一次 BitBlt，不用反复叠半透明黑。"""
         self._release_capture_buffers()
         vsx, vsy, vsw, vsh = self.vs
         self.shot_buf = grab_screen(vsx, vsy, vsw, vsh)
@@ -2238,11 +2788,14 @@ class App:
 
         # 预先合成“原图 + 变暗”，每帧只需一次 BitBlt
         gdi32.BitBlt(self.dc_dim, 0, 0, vsw, vsh, self.dc_shot, 0, 0, SRCCOPY)
-        g = GFX(self.dc_dim)
-        g.fill(0x9A000000, 0, 0, vsw, vsh)
-        g.close()
+        with GFX(self.dc_dim) as g:
+            g.fill(0x9A000000, 0, 0, vsw, vsh)
 
     def _release_capture_buffers(self):
+        """释放截图期间的缓冲和屏幕 DC。
+
+        工具条的玻璃底是从这套缓冲里取的，缓冲一换必须一并作废，否则会用到
+        已经删掉的 DC（花屏或崩溃）。"""
         for name in ("shot", "dim", "back"):
             dc = getattr(self, "dc_" + name, None)
             if dc:
@@ -2262,12 +2815,16 @@ class App:
         self._release_screen_dc()
         self.shot_raw = None
         self._mos_cache = {}
+        self._cells_cache = {}
         # 玻璃底取自这套缓冲，缓冲一换就必须作废
         self.tb_glass = None
         self.tb_glass_key = None
 
     # ---------- 自动识别
     def _request_probe(self, sx, sy, force=False):
+        """限流地请求控件识别：换了窗口、或移动超过 70px 才重查一次。
+
+        不这么限的话，鼠标一动就几百次 COM 调用，界面直接卡住。"""
         now = time.time()
         dx = abs(sx - self.probe_pt[0])
         dy = abs(sy - self.probe_pt[1])
@@ -2316,8 +2873,12 @@ class App:
         else:
             self.auto_rect = None
 
-    # ---------- 合成
+    # ================================================== 5. 遮罩合成与标注绘制
     def _compose_overlay(self, W, H):
+        """合成遮罩的整帧：压暗底 → 挖亮选区 → 画标注 → 选区框与手柄 → 提示条。
+
+        每帧都从 dc_dim 重新起画（不是在上帧结果上叠加），所以撤销、拖标注、
+        切模式都不会留下残影。"""
         if not self.dc_back:
             return
         # 兜底：dc_back 是长期复用的离屏 DC。GDI 侧绘制依赖的
@@ -2343,62 +2904,69 @@ class App:
             sh_ = max(1, min(bright[3], H - sy))
             gdi32.BitBlt(self.dc_back, sx, sy, sw_, sh_, self.dc_shot, sx, sy, SRCCOPY)
 
-        g = GFX(self.dc_back)
-        if bright:
-            bx, by, bw_, bh_ = bright
-            g.stroke_round(C_ACCENT, max(1.0, self.px(1.6)),
-                           bx - 0.5, by - 0.5, bw_ + 1, bh_ + 1, 0.5)
-            if sel:
-                if self.drag_mode != "new" and not self.draw_start:
-                    self._draw_handles(g, sel)
-                self._draw_shapes(g)
-                # 正在拖的画笔 / 箭头也要裁进选区，不能让笔画露到框外。
-                st = g.clip_save()
-                g.clip_rect(sel[0], sel[1], sel[2], sel[3])
-                if self.pending:
-                    self._draw_one_shape(g, self.dc_shot, self.pending, 0, 0)
-                g.clip_restore(st)
+        with GFX(self.dc_back) as g:
+            if bright:
+                bx, by, bw_, bh_ = bright
+                g.stroke_round(C_ACCENT, max(1.0, self.px(1.6)),
+                               bx - 0.5, by - 0.5, bw_ + 1, bh_ + 1, 0.5)
+                if sel:
+                    if self.drag_mode != "new" and not self.draw_start:
+                        self._draw_handles(g, sel)
+                    self._draw_shapes(g)
+                    # 正在拖的画笔 / 箭头也要裁进选区，不能让笔画露到框外。
+                    st = g.clip_save()
+                    g.clip_rect(sel[0], sel[1], sel[2], sel[3])
+                    if self.pending:
+                        self._draw_one_shape(g, self.dc_shot, self.pending, 0, 0)
+                    g.clip_restore(st)
 
-            # 尺寸标签（+ 自动识别的来源提示）
-            label = "%d × %d" % (bw_, bh_)
-            if not sel and self.auto_src:
-                label += "   单击捕获此" + self.auto_src
-            lw = self.px(96) + (self.px(132) if not sel else 0)
-            lh = self.px(25)
-            lx = bx
-            ly = by - lh - self.px(6)
-            if ly < self.px(4):
-                ly = by + self.px(6)
-                if ly + lh > H - self.px(4):
-                    ly = max(self.px(4), H - lh - self.px(4))
-            lx = max(self.px(4), min(lx, W - lw - self.px(4)))
-            g.fill_round(0xF01A1D24, lx, ly, lw, lh, self.px(6))
-            g.text(label, self.px(12), C_WHITE, lx, ly, lw, lh, 1, True)
+                # 尺寸标签（+ 自动识别的来源提示）
+                label = "%d × %d" % (bw_, bh_)
+                if not sel and self.auto_src:
+                    label += "   单击捕获此" + self.auto_src
+                lw = self.px(96) + (self.px(132) if not sel else 0)
+                lh = self.px(25)
+                lx = bx
+                ly = by - lh - self.px(6)
+                if ly < self.px(4):
+                    ly = by + self.px(6)
+                    if ly + lh > H - self.px(4):
+                        ly = max(self.px(4), H - lh - self.px(4))
+                lx = max(self.px(4), min(lx, W - lw - self.px(4)))
+                g.fill_round(0xF01A1D24, lx, ly, lw, lh, self.px(6))
+                g.text(label, self.px(12), C_WHITE, lx, ly, lw, lh, 1, True)
 
-            if self.mode or self.sel_shape is not None:
-                self._draw_tip(g, W, self._mode_tip())
-        else:
-            self._draw_tip(g, W, self._mode_tip() if self.mode else
-                           "移动鼠标自动识别窗口/区域   ·   拖动自由框选   ·   Esc 取消")
-            mx, my = self.mouse
-            g.line(0x55FFFFFF, 1, mx, 0, mx, H)
-            g.line(0x55FFFFFF, 1, 0, my, W, my)
-        g.close()
+                if self.mode or self.sel_shape is not None:
+                    self._draw_tip(g, W, self._mode_tip())
+            else:
+                self._draw_tip(g, W, self._mode_tip() if self.mode else
+                               "移动鼠标自动识别窗口/区域   ·   拖动自由框选   ·   Esc 取消")
+                mx, my = self.mouse
+                g.line(0x55FFFFFF, 1, mx, 0, mx, H)
+                g.line(0x55FFFFFF, 1, 0, my, W, my)
 
     def _mode_tip(self):
+        """当前模式在提示条上显示的那句话"""
         if self.mode == "pen":
             return "按住左键自由写画   ·   上排可切颜色 / 粗细   ·   Esc 退出"
         if self.mode == "mosaic":
             return "按住左键涂抹马赛克   ·   上排可切笔头粗细 / 块大小   ·   Esc 退出"
         if self.mode == "arrow":
             return "拖动画箭头   ·   选中后拖两端可改方向 / 长度   ·   Esc 退出"
+        if self.mode == "rect":
+            return "拖动画方框   ·   选中后拖四角改大小   ·   上排可切颜色 / 线宽   ·   Esc 退出"
+        if self.mode == "ellipse":
+            return "拖动画圆形   ·   选中后拖四角改大小   ·   上排可切颜色 / 线宽   ·   Esc 退出"
         if self.sel_shape is not None:
             if self.sel_shape.get("t") == "arrow":
                 return "拖端点改方向 · 拖线身整体移动 · 方向键微调 · Delete 删除"
+            if self.sel_shape.get("t") in ("rect", "ellipse"):
+                return "拖四角改大小 · 拖边框整体移动 · 方向键微调 · Delete 删除"
             return "拖动标注移动位置 · 方向键微调 · Delete 删除"
         return "拖动空白重新框选   ·   单击标注可选中   ·   Esc 取消"
 
     def _draw_tip(self, g, W, tip):
+        """画底部提示条。先量文字宽度再定气泡宽，文字才不会顶到边框"""
         fs = self.px(13)
         tw_text = g.measure(tip, fs)[0] if tip else 0.0
         tw = min(W - self.px(24), max(self.px(300), tw_text + self.px(40)))
@@ -2414,6 +2982,8 @@ class App:
                 ("se", 2, 2), ("s", 1, 2), ("sw", 0, 2), ("w", 0, 1))
 
     def _handle_rects(self, sel):
+        """选区八个手柄（四角 + 四边）的矩形。命中判断和绘制共用这一份，
+        两边算的必须完全一致，否则会出现“看着能拖、实际拖不动”"""
         x, y, ww, hh = sel
         out = []
         for name, cx, cy in self._HANDLES:
@@ -2424,11 +2994,12 @@ class App:
         return out
 
     def _draw_handles(self, g, sel):
+        """画选区手柄：白底 + 深色描边，保证在亮背景和暗背景上都看得见"""
         for name, hx, hy, hw_, hh_ in self._handle_rects(sel):
             g.fill_round(0xFFFFFFFF, hx, hy, hw_, hh_, self.px(2))
             g.stroke_round(C_ACCENT, max(1.0, self.px(1.3)), hx, hy, hw_, hh_, self.px(2))
 
-    # ---------- 标注绘制（文字 / 马赛克 / 箭头）
+    # ---------- 标注绘制（画笔 / 马赛克 / 箭头 / 方框 / 圆形）
     def _draw_arrow_item(self, g, x1, y1, x2, y2, color_idx=0, scale=1.0):
         """参考图样式：一根细直线 + 实心长三角头（不是两撇箭翼）"""
         color = ANNO_COLORS[max(0, min(color_idx, len(ANNO_COLORS) - 1))]
@@ -2469,13 +3040,23 @@ class App:
             g.line(color, w, x1 + ox, y1 + oy, x2 + ox, y2 + oy, 2)
 
     def _stroke_cells(self, sh):
-        """笔刷马赛克覆盖到的网格单元（屏幕坐标对齐网格），按点数缓存"""
+        """笔刷马赛克覆盖到的顶点单元集合（屏幕坐标对齐网格），带缓存。
+
+        缓存不放在标注字典里，而是放在 App 的 _cells_cache —— 标注字典只存
+        「画的是什么」，撤销快照、平移、改色都不用再记得去清缓存，也就不会
+        出现「清了这里忘了那里」导致的马赛克错位。
+
+        命中条件用「pts 列表本身（同一个对象）+ 点数 + 块大小 + 半径」：
+        画的过程中是往同一个列表 append（点数变），平移是换成一个新列表
+        （对象变），两种情况都会自然失效。命中时还比对 `is`，所以即使
+        列表被回收、id 被别的对象复用，也不会读到别人的结果。"""
         blk = max(4, sh.get("blk") or self._mosaic_blk())
         pts = sh.get("pts") or []
-        ver = (len(pts), blk, sh.get("_v", 0))
-        if sh.get("_vc") == ver:
-            return sh["_cells"]
         r = max(2.0, sh.get("r") or self._mosaic_r())
+        ck = (id(pts), len(pts), blk, r)
+        hit = self._cells_cache.get(ck)
+        if hit is not None and hit[0] is pts:
+            return hit[1]
         rr = r * r
         cells = set()
         step = max(1.0, blk * 0.45)
@@ -2503,8 +3084,10 @@ class App:
                 for j in range(1, k):
                     t = j / float(k)
                     add(qx + (px_ - qx) * t, qy + (py_ - qy) * t)
-        sh["_vc"] = ver
-        sh["_cells"] = cells
+        # 缓存里同时存一份 pts 引用：只要这条还在，id 就不会被复用
+        if len(self._cells_cache) > 64:
+            self._cells_cache.clear()
+        self._cells_cache[ck] = (pts, cells)
         return cells
 
     def _mosaic_color(self, gx, gy, blk):
@@ -2561,6 +3144,8 @@ class App:
             sh = self.sel_shape
             if sh.get("t") == "arrow":
                 self._draw_arrow_ends(g, sh, ox, oy)
+            elif sh.get("t") in ("rect", "ellipse"):
+                self._draw_box_handles(g, sh, ox, oy)
         if st is not None:
             g.clip_restore(st)
 
@@ -2582,11 +3167,71 @@ class App:
         return hypot(x - (x1 + dx * t), y - (y1 + dy * t))
 
     def _arrow_near(self, sh, x, y):
+        """点是否落在箭头附近（两端手柄范围或线身的容差内）"""
         tol = float(self.px(ARROW_HIT_TOL))
         r = float(self.px(ARROW_HANDLE_R + 3))
         if hypot(x - sh["x1"], y - sh["y1"]) <= r or hypot(x - sh["x2"], y - sh["y2"]) <= r:
             return True
         return self._arrow_dist(x, y, sh["x1"], sh["y1"], sh["x2"], sh["y2"]) <= tol
+
+    # ---------- 方框 / 圆形
+    def _box_rect(self, sh):
+        """归一化矩形 (x, y, w, h)：x1..y2 是拖动时的两个对角，可能反向"""
+        x1, y1, x2, y2 = sh["x1"], sh["y1"], sh["x2"], sh["y2"]
+        return min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1)
+
+    def _draw_box_item(self, g, sh, ox=0, oy=0):
+        """画一个方框 / 圆形标注（按当前颜色和线宽）"""
+        x, y, ww, hh = self._box_rect(sh)
+        if ww < 0.5 or hh < 0.5:
+            return
+        color = ANNO_COLORS[max(0, min(sh.get("color", 0), len(ANNO_COLORS) - 1))]
+        w = max(1.5, float(sh.get("w") or self._pen_w()))
+        if sh.get("t") == "rect":
+            g.stroke_box(color, w, x + ox, y + oy, ww, hh)
+        else:
+            g.stroke_ellipse(color, w, x + ox, y + oy, ww, hh)
+
+    def _box_corners(self, sh, ox=0, oy=0):
+        """四角坐标：左上 / 右上 / 右下 / 左下（顺序和手柄编号一致）"""
+        x, y, ww, hh = self._box_rect(sh)
+        return ((x + ox, y + oy), (x + ww + ox, y + oy),
+                (x + ww + ox, y + hh + oy), (x + ox, y + hh + oy))
+
+    def _draw_box_handles(self, g, sh, ox=0, oy=0):
+        """画方框 / 圆形被选中时的四角手柄"""
+        r = self.px(BOX_HANDLE_R)
+        for cx, cy in self._box_corners(sh, ox, oy):
+            g.fill_round(0xFFFFFFFF, cx - r, cy - r, r * 2, r * 2, self.px(2))
+            g.stroke_round(C_ACCENT, max(1.0, self.px(1.4)),
+                           cx - r, cy - r, r * 2, r * 2, self.px(2))
+
+    def _box_handle_at(self, sh, x, y):
+        """点在第几个角上：1..4，0 = 不在任何角上"""
+        r = float(self.px(BOX_HANDLE_R + 5))
+        for i, (cx, cy) in enumerate(self._box_corners(sh)):
+            if hypot(x - cx, y - cy) <= r:
+                return i + 1
+        return 0
+
+    def _box_near(self, sh, x, y):
+        """点是否落在边框附近的环带上（点中间空白不算选中，方便在里面继续画）"""
+        tol = float(self.px(BOX_HIT_TOL))
+        bx, by, bw, bh = self._box_rect(sh)
+        if bw < 1.0 or bh < 1.0:
+            return False
+        if sh.get("t") == "rect":
+            if not (bx - tol <= x <= bx + bw + tol
+                    and by - tol <= y <= by + bh + tol):
+                return False
+            return min(abs(x - bx), abs(x - bx - bw),
+                       abs(y - by), abs(y - by - bh)) <= tol
+        # 椭圆：换算到单位圆，看归一化半径是否贴近 1
+        cx, cy = bx + bw / 2.0, by + bh / 2.0
+        rx, ry = bw / 2.0, bh / 2.0
+        rr = hypot((x - cx) / rx, (y - cy) / ry)
+        band = max(tol / max(rx, ry), 0.06)
+        return abs(rr - 1.0) <= band
 
     def _arrow_end_at(self, sh, x, y):
         """点在哪个端点上（1=起点 2=终点 0=都不是）"""
@@ -2623,7 +3268,6 @@ class App:
         dx, dy = self._fit_delta(bx, by, bw, bh, dx, dy)
         sh["x1"], sh["y1"] = x1 + dx, y1 + dy
         sh["x2"], sh["y2"] = x2 + dx, y2 + dy
-        sh.pop("_bb", None)
 
     def _translate_shapes(self, dx, dy):
         """选区整体移动时，标注跟着一起走"""
@@ -2631,58 +3275,75 @@ class App:
             return
         for sh in self.shapes:
             t = sh.get("t")
-            if t == "arrow":
+            if t in ("arrow", "rect", "ellipse"):
                 sh["x1"] += dx; sh["y1"] += dy
                 sh["x2"] += dx; sh["y2"] += dy
             elif t in ("mosaic", "pen"):
+                # 换成一个新列表 → 马赛克网格缓存按「pts 对象」判失效
                 sh["pts"] = [(px_ + dx, py_ + dy) for px_, py_ in sh.get("pts") or []]
-                sh["_v"] = sh.get("_v", 0) + 1      # 网格对齐变了，缓存作废
-            sh.pop("_bb", None)
         if self.pending:
             self._translate_shapes_one(self.pending, dx, dy)
 
     def _translate_shapes_one(self, sh, dx, dy):
+        """整体平移一条标注（选区跟着动时，标注要一起动）"""
         t = sh.get("t")
-        if t == "arrow":
+        if t in ("arrow", "rect", "ellipse"):
             sh["x1"] += dx; sh["y1"] += dy
             sh["x2"] += dx; sh["y2"] += dy
         elif t in ("mosaic", "pen"):
             sh["pts"] = [(px_ + dx, py_ + dy) for px_, py_ in sh.get("pts") or []]
-            sh["_v"] = sh.get("_v", 0) + 1
 
     def _hit_shape(self, x, y):
+        """从后往前找命中的标注：后画的在上层，优先选中它"""
         for sh in reversed(self.shapes):
             t = sh.get("t")
             if t == "arrow" and self._arrow_near(sh, x, y):
                 return sh
+            if t in ("rect", "ellipse") and self._box_near(sh, x, y):
+                return sh
         return None
 
     def _draw_one_shape(self, g, src, sh, ox, oy):
+        """按标注类型分派绘制（画笔 / 马赛克 / 箭头 / 方框 / 圆形）"""
         t = sh.get("t")
         if t == "pen":
             self._draw_pen_item(g, sh, ox, oy)
         elif t == "mosaic":
             self._draw_mosaic_item(g, sh, ox, oy)
+        elif t in ("rect", "ellipse"):
+            self._draw_box_item(g, sh, ox, oy)
         elif t == "arrow":
             x1, y1, x2, y2 = sh["x1"], sh["y1"], sh["x2"], sh["y2"]
             self._draw_arrow_item(g, x1 + ox, y1 + oy, x2 + ox, y2 + oy,
                                   sh.get("color", 0))
-            pad = self.px(6)
-            sh["_bb"] = (min(x1, x2) - pad, min(y1, y2) - pad,
-                         abs(x2 - x1) + pad * 2, abs(y2 - y1) + pad * 2)
 
     def _paint_overlay(self, hwnd):
+        """响应遮罩的 WM_PAINT：只把已有的一帧重新提交，不重新合成。
+
+        分层窗口的画面由 UpdateLayeredWindow 提交，本来就不靠 WM_PAINT 绘制。
+        以前这里调 _redraw_overlay()，等于每来一条重绘请求就把整屏重新合成一遍
+        （实测 compose=1 present=1，约 13ms），而那时状态并没有变化 —— 纯浪费。
+
+        现在只做一次 _present_overlay：dc_back 里始终是最近一次合成好的整帧，
+        重推一遍即便系统丢过表面也能自愈，代价只是一次 ULW。
+        真正改变画面的地方全部显式调 _redraw_overlay()（24 处），不依赖这条消息。"""
         ps = PAINTSTRUCT()
         user32.BeginPaint(hwnd, byref(ps))
-        self._redraw_overlay()
+        self._present_overlay()
         user32.EndPaint(hwnd, byref(ps))
 
     def _redraw_overlay(self):
+        """重算并提交遮罩的一帧。所有改动最后都收口到这一个函数"""
         vsw, vsh = self.vs[2], self.vs[3]
         self._compose_overlay(vsw, vsh)
         self._present_overlay()
 
+    # ================================================== 6. 遮罩交互 —— 消息 / 选区 / 标注状态
     def _on_overlay(self, hwnd, msg, wp, lp):
+        """遮罩窗口过程 —— 只按消息类型分派，具体动作在下面的 _ov_* 方法里。
+
+        以前这里是 317 行的巨型 if 链，想改「拖选区」得先通读全文；现在
+        「一次鼠标动作 = 一个方法」，改哪段看哪个方法就行。"""
         if msg == 0x8002:                    # 重建工具条（选项排展开/收起）
             if self.sel:
                 self._show_tool()
@@ -2699,264 +3360,340 @@ class App:
             self._raise_tool()
             return user32.DefWindowProcW(hwnd, msg, wp, lp)
         if msg == WM_MOUSEMOVE:
-            x, y = lo(lp), hi(lp)
-            self.mouse = (x, y)
-            if self.mode and not self.drag_mode:
-                # 画笔 / 马赛克时鼠标是专用笔头，不再是十字
-                user32.SetCursor(self._cursor_for())
-                if self.draw_start:
-                    self._update_pending(x, y)
-                    self._redraw_overlay()
-                return 0
-            if self.drag_mode:
-                if (not self.press_moved and self.press_pt
-                        and abs(x - self.press_pt[0]) + abs(y - self.press_pt[1]) > self.px(4)):
-                    self.press_moved = True
-                    if self.drag_mode == "new":
-                        # 开始拖新选区 = 放弃上一批标注。
-                        # 否则旧笔迹会被裁进新选区（位置错乱），保存时也会被一起烤进去。
-                        # 行为与「重选」按钮保持一致。
-                        self.sel = None
-                        if self.shapes or self.sel_shape is not None:
-                            self.shapes = []
-                            self.sel_shape = None
-                            self.undo_stack.clear()
-                            self.redo_stack.clear()
-                if self.drag_mode == "shape":
-                    if self.sel_shape is not None and self.shape0:
-                        self._move_shape(self.sel_shape, self.shape0,
-                                         x - self.press_pt[0], y - self.press_pt[1])
-                        self.press_moved = True
-                elif self.drag_mode == "arrow_end":
-                    sh = self.sel_shape
-                    if sh is not None and self.drag_end:
-                        ex, ey = self._clamp_to_sel(x, y)
-                        if self.drag_end == 1:
-                            sh["x1"], sh["y1"] = ex, ey
-                        else:
-                            sh["x2"], sh["y2"] = ex, ey
-                        sh.pop("_bb", None)
-                        self.press_moved = True
-                elif self.drag_mode == "new":
-                    if self.press_moved:
-                        self.sel = self._norm(self.press_pt, (x, y))
-                elif self.drag_mode == "move":
-                    if self.press_moved and self.sel0:
-                        ns = self._move_sel(self.sel0, x, y)
-                        if self.sel:
-                            self._translate_shapes(ns[0] - self.sel[0],
-                                                   ns[1] - self.sel[1])
-                        self.sel = ns
-                elif self.drag_mode == "resize":
-                    if self.sel0:
-                        self.sel = self._resize_sel(self.sel0, self.drag_handle, x, y)
-            else:
-                if self._hit_shape(x, y) is not None:
-                    if self.hcur_move:
-                        user32.SetCursor(self.hcur_move)
-                self._update_auto(x, y)
-            self._redraw_overlay()
+            self._ov_move(lo(lp), hi(lp))
             return 0
         if msg == WM_LBUTTONDOWN:
-            self._raise_tool()          # 点击遮罩时保证工具条不被压到下面
-            x, y = lo(lp), hi(lp)
-            self.drag_snap = self._snap()      # 动作前的状态（拖动/绘制结束后入撤销栈）
-
-            # ① 选中箭头的端点优先：拖端点 = 改方向 / 改长度
-            cur = self.sel_shape
-            if cur is not None and cur.get("t") == "arrow":
-                e = self._arrow_end_at(cur, x, y)
-                if e:
-                    self.drag_mode, self.drag_end = "arrow_end", e
-                    self.press_pt = (x, y)
-                    self.press_moved = False
-                    return 0
-
-            if self.mode == "pen":
-                cx, cy = self._clamp_to_sel(x, y)
-                self.draw_start = (cx, cy)
-                self.pending = {"t": "pen", "pts": [(cx, cy)],
-                                "color": self._color_idx(),
-                                "w": self._pen_w()}
-                self._redraw_overlay()
-                return 0
-            if self.mode == "mosaic":
-                cx, cy = self._clamp_to_sel(x, y)
-                self.draw_start = (cx, cy)
-                self.pending = {"t": "mosaic", "pts": [(cx, cy)],
-                                "r": self._mosaic_r(),
-                                "blk": self._mosaic_blk()}
-                self._redraw_overlay()
-                return 0
-            if self.mode == "arrow":
-                # 箭头工具下点已有箭头 = 选中它（可拖端点 / 整体），否则画新的
-                sh = self._hit_shape(x, y)
-                if sh is not None and sh.get("t") == "arrow":
-                    self.sel_shape = sh
-                    self._sync_opts(sh)
-                    e = self._arrow_end_at(sh, x, y)
-                    if e:
-                        self.drag_mode, self.drag_end = "arrow_end", e
-                    else:
-                        self.drag_mode = "shape"
-                        self.shape0 = self._shape_origin(sh)
-                    self.press_pt = (x, y)
-                    self.press_moved = False
-                    self._redraw_overlay()
-                    self._refresh_tool()
-                    return 0
-                cx, cy = self._clamp_to_sel(x, y)
-                self.draw_start = (cx, cy)
-                self.pending = None
-                self._redraw_overlay()
-                return 0
-            # 先看是不是点中了已有的标注：点中就进入拖动
-            sh = self._hit_shape(x, y)
-            if sh is not None:
-                self.sel_shape = sh
-                self._sync_opts(sh)
-                self.drag_mode = "shape"
-                self.shape0 = self._shape_origin(sh)
-                self.press_pt = (x, y)
-                self.press_moved = False
-                self.dragging = False
-                self._redraw_overlay()
-                self._refresh_tool()
-                return 0
-            if self.sel_shape is not None:
-                self.sel_shape = None
-                self._redraw_overlay()
-                self._refresh_tool()
-            self._close_tool()
-            self.mouse = (x, y)
-            self.press_pt = (x, y)
-            self.press_moved = False
-            self.dragging = True
-            z = self._hit_zone(x, y)
-            if z == "move":
-                self.drag_mode, self.sel0 = "move", self.sel
-            elif z == "outside":
-                self.drag_mode, self.sel0 = "new", self.sel
-            else:
-                self.drag_mode, self.drag_handle, self.sel0 = "resize", z, self.sel
-            self._redraw_overlay()
+            self._ov_down(lo(lp), hi(lp))
             return 0
         if msg == WM_LBUTTONUP:
-            if self.drag_mode in ("shape", "arrow_end"):
-                if self.press_moved:
-                    self._push_snap(self.drag_snap)     # 拖动完了才记一步撤销
-                self.drag_mode = None
-                self.drag_end = 0
-                self.shape0 = None
-                self._redraw_overlay()
-                if self.sel:
-                    self._show_tool()
-                return 0
-            if self.mode in ("pen", "mosaic", "arrow"):
-                added = False
-                if self.draw_start and self.pending:
-                    sh = self.pending
-                    if sh["t"] == "arrow":
-                        if hypot(sh["x2"] - sh["x1"], sh["y2"] - sh["y1"]) > self.px(12):
-                            self.shapes.append(sh)
-                            added = True
-                    elif len(sh["pts"]) >= 1:
-                        self.shapes.append(sh)
-                        added = True
-                if added:
-                    self._push_snap(self.drag_snap)
-                self.pending = None
-                self.draw_start = None
-                self._redraw_overlay()     # 保持当前工具，可以连续画多笔
-                return 0
-            if self.mode:
-                return 0
-            was_new = (self.drag_mode == "new")
-            if self.drag_mode == "move" and self.press_moved:
-                self._push_snap(self.drag_snap)         # 选区带着标注一起移动，可撤销
-            self.dragging = False
-            if not self.press_moved and was_new and self.auto_rect:
-                # 没拖动 = 单击，直接采纳自动识别到的区域
-                self.sel = self.auto_rect
-                self.auto_rect = None
-            self.drag_mode = None
-            self.drag_handle = None
-            self.sel0 = None
-            if self.sel:
-                self.sel = self._clamp_sel(self.sel)
-            if not self.sel or self.sel[2] < self.px(5) or self.sel[3] < self.px(5):
-                self.sel = None
-                self._redraw_overlay()
-                return 0
-            self._redraw_overlay()
-            self._show_tool()
+            self._ov_up()
             return 0
         if msg == WM_LBUTTONDBLCLK:
-            x, y = lo(lp), hi(lp)
-            sh = self._hit_shape(x, y)
-            if sh is None and self.sel and self._in(x, y, self.sel):
-                self._action_copy()             # 双击空白 = 直接复制
+            self._ov_dblclick(lo(lp), hi(lp))
             return 0
         if msg == WM_RBUTTONDOWN:
-            if self.mode:
-                self._leave_mode()
-            elif self.sel_shape is not None:
-                self.sel_shape = None
-                self._redraw_overlay()
-                self._refresh_tool()
-            elif self.shapes:
-                self._push_snap(self._snap())      # 右键删最后一笔，也能撤销回来
-                self.shapes.pop()
-                self._redraw_overlay()
-            else:
-                self._cancel_capture()
-            return 0
-        if msg == WM_KEYDOWN and wp == VK_ESCAPE:
-            if self.sel_shape is not None:
-                self.sel_shape = None
-                self._redraw_overlay()
-                self._refresh_tool()
-            elif self.mode:
-                self._leave_mode()
-            else:
-                self._cancel_capture()
+            self._ov_right()
             return 0
         if msg == WM_KEYDOWN:
-            ctrl = bool(user32.GetKeyState(VK_CONTROL) & 0x8000)
-            shift = bool(user32.GetKeyState(VK_SHIFT) & 0x8000)
-            if wp == 0x2E and self.sel_shape is not None:      # Delete
-                if self.sel_shape in self.shapes:
-                    self._push_snap(self._snap())
-                    self.shapes.remove(self.sel_shape)
-                self.sel_shape = None
-                self._redraw_overlay()
-                self._refresh_tool()
+            if wp == VK_ESCAPE:
+                self._ov_escape()
                 return 0
-            if (wp == 0x59 and ctrl) or (wp == 0x5A and ctrl and shift):
-                self._redo()                                    # Ctrl+Y / Ctrl+Shift+Z
-                return 0
-            if (wp == 0x5A and ctrl) or wp == 0x08:
-                self._undo()                                    # Ctrl+Z / Backspace
-                return 0
-            # 方向键微调：1px，按住 Shift 是 10px（连续按算一步撤销）
-            if self.sel_shape is not None and wp in (0x25, 0x26, 0x27, 0x28):
-                step = self.px(10) if shift else 1
-                dx = -step if wp == 0x25 else (step if wp == 0x27 else 0)
-                dy = -step if wp == 0x26 else (step if wp == 0x28 else 0)
-                now = time.time()
-                if now - self.nudge_t > 0.8:
-                    self._push_snap(self._snap())
-                self.nudge_t = now
-                self._move_shape(self.sel_shape, self._shape_origin(self.sel_shape),
-                                 dx, dy)
-                self._redraw_overlay()
+            if self._ov_key(wp):
                 return 0
         if msg == WM_SETCURSOR:
             user32.SetCursor(self._cursor_for())
             return 1
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
+    def _ov_move(self, x, y):
+        """鼠标移动：画标注、改选区、悬停高亮都从这里进。"""
+        self.mouse = (x, y)
+        if self.mode and not self.drag_mode:
+            # 画笔 / 马赛克时鼠标是专用笔头，不再是十字
+            user32.SetCursor(self._cursor_for())
+            if self.draw_start:
+                self._update_pending(x, y)
+                self._redraw_overlay()
+            return
+        if self.drag_mode:
+            if (not self.press_moved and self.press_pt
+                    and abs(x - self.press_pt[0]) + abs(y - self.press_pt[1]) > self.px(4)):
+                self.press_moved = True
+                if self.drag_mode == "new":
+                    # 开始拖新选区 = 放弃上一批标注。
+                    # 否则旧笔迹会被裁进新选区（位置错乱），保存时也会被一起烤进去。
+                    # 行为与「重选」按钮保持一致。
+                    self.sel = None
+                    if self.shapes or self.sel_shape is not None:
+                        self.shapes = []
+                        self.sel_shape = None
+                        self.undo_stack.clear()
+                        self.redo_stack.clear()
+            if self.drag_mode == "shape":
+                if self.sel_shape is not None and self.shape0:
+                    self._move_shape(self.sel_shape, self.shape0,
+                                     x - self.press_pt[0], y - self.press_pt[1])
+                    self.press_moved = True
+            elif self.drag_mode == "arrow_end":
+                sh = self.sel_shape
+                if sh is not None and self.drag_end:
+                    ex, ey = self._clamp_to_sel(x, y)
+                    if self.drag_end == 1:
+                        sh["x1"], sh["y1"] = ex, ey
+                    else:
+                        sh["x2"], sh["y2"] = ex, ey
+                    self.press_moved = True
+            elif self.drag_mode == "box_resize":
+                sh = self.sel_shape
+                if sh is not None and self.shape0 and self.drag_end:
+                    # 对角固定，被拖的角跟着鼠标走
+                    x1, y1, x2, y2 = self.shape0
+                    bx, by = min(x1, x2), min(y1, y2)
+                    bw, bh = abs(x2 - x1), abs(y2 - y1)
+                    corners = ((bx, by), (bx + bw, by),
+                               (bx + bw, by + bh), (bx, by + bh))
+                    ax, ay = corners[(self.drag_end - 1 + 2) % 4]
+                    ex, ey = self._clamp_to_sel(x, y)
+                    sh["x1"], sh["y1"] = ax, ay
+                    sh["x2"], sh["y2"] = ex, ey
+                    self.press_moved = True
+            elif self.drag_mode == "new":
+                if self.press_moved:
+                    self.sel = self._norm(self.press_pt, (x, y))
+            elif self.drag_mode == "move":
+                if self.press_moved and self.sel0:
+                    ns = self._move_sel(self.sel0, x, y)
+                    if self.sel:
+                        self._translate_shapes(ns[0] - self.sel[0],
+                                               ns[1] - self.sel[1])
+                    self.sel = ns
+            elif self.drag_mode == "resize":
+                if self.sel0:
+                    self.sel = self._resize_sel(self.sel0, self.drag_handle, x, y)
+        else:
+            if self._hit_shape(x, y) is not None:
+                if self.hcur_move:
+                    user32.SetCursor(self.hcur_move)
+            self._update_auto(x, y)
+        self._redraw_overlay()
+        return
+
+    def _ov_down(self, x, y):
+        """鼠标左键按下：按当前模式决定是「画一笔」还是「开始拖」。"""
+        self._raise_tool()          # 点击遮罩时保证工具条不被压到下面
+        self.drag_snap = self._snap()      # 动作前的状态（拖动/绘制结束后入撤销栈）
+
+        # ① 选中箭头的端点优先：拖端点 = 改方向 / 改长度
+        cur = self.sel_shape
+        if cur is not None and cur.get("t") == "arrow":
+            e = self._arrow_end_at(cur, x, y)
+            if e:
+                self.drag_mode, self.drag_end = "arrow_end", e
+                self.press_pt = (x, y)
+                self.press_moved = False
+                return
+
+        if self.mode == "pen":
+            cx, cy = self._clamp_to_sel(x, y)
+            self.draw_start = (cx, cy)
+            self.pending = {"t": "pen", "pts": [(cx, cy)],
+                            "color": self._color_idx(),
+                            "w": self._pen_w()}
+            self._redraw_overlay()
+            return
+        if self.mode == "mosaic":
+            cx, cy = self._clamp_to_sel(x, y)
+            self.draw_start = (cx, cy)
+            self.pending = {"t": "mosaic", "pts": [(cx, cy)],
+                            "r": self._mosaic_r(),
+                            "blk": self._mosaic_blk()}
+            self._redraw_overlay()
+            return
+        if self.mode == "arrow":
+            # 箭头工具下点已有箭头 = 选中它（可拖端点 / 整体），否则画新的
+            sh = self._hit_shape(x, y)
+            if sh is not None and sh.get("t") == "arrow":
+                self.sel_shape = sh
+                self._sync_opts(sh)
+                e = self._arrow_end_at(sh, x, y)
+                if e:
+                    self.drag_mode, self.drag_end = "arrow_end", e
+                else:
+                    self.drag_mode = "shape"
+                    self.shape0 = self._shape_origin(sh)
+                self.press_pt = (x, y)
+                self.press_moved = False
+                self._redraw_overlay()
+                self._refresh_tool()
+                return
+            cx, cy = self._clamp_to_sel(x, y)
+            self.draw_start = (cx, cy)
+            self.pending = None
+            self._redraw_overlay()
+            return
+        if self.mode in ("rect", "ellipse"):
+            # 点中同类形状 = 选中它（拖四角改大小 / 拖边框整体移动），否则画新的
+            sh = self._hit_shape(x, y)
+            if sh is not None and sh.get("t") == self.mode:
+                self.sel_shape = sh
+                self._sync_opts(sh)
+                h = self._box_handle_at(sh, x, y)
+                self.drag_mode = "box_resize" if h else "shape"
+                self.drag_end = h
+                self.shape0 = self._shape_origin(sh)
+                self.press_pt = (x, y)
+                self.press_moved = False
+                self._redraw_overlay()
+                self._refresh_tool()
+                return
+            cx, cy = self._clamp_to_sel(x, y)
+            self.draw_start = (cx, cy)
+            self.pending = {"t": self.mode, "x1": cx, "y1": cy,
+                            "x2": cx, "y2": cy,
+                            "color": self._color_idx(), "w": self._pen_w()}
+            self._redraw_overlay()
+            return
+        # 先看是不是点中了已有的标注：点中就进入拖动
+        sh = self._hit_shape(x, y)
+        if sh is not None:
+            self.sel_shape = sh
+            self._sync_opts(sh)
+            self.drag_mode = "shape"
+            self.shape0 = self._shape_origin(sh)
+            self.press_pt = (x, y)
+            self.press_moved = False
+            self.dragging = False
+            self._redraw_overlay()
+            self._refresh_tool()
+            return
+        if self.sel_shape is not None:
+            self.sel_shape = None
+            self._redraw_overlay()
+            self._refresh_tool()
+        self._close_tool()
+        self.mouse = (x, y)
+        self.press_pt = (x, y)
+        self.press_moved = False
+        self.dragging = True
+        z = self._hit_zone(x, y)
+        if z == "move":
+            self.drag_mode, self.sel0 = "move", self.sel
+        elif z == "outside":
+            self.drag_mode, self.sel0 = "new", self.sel
+        else:
+            self.drag_mode, self.drag_handle, self.sel0 = "resize", z, self.sel
+        self._redraw_overlay()
+        return
+
+    def _ov_up(self):
+        """鼠标左键抬起：把刚才那一笔落到 shapes 里，或结束一次拖动。"""
+        if self.drag_mode in ("shape", "arrow_end", "box_resize"):
+            if self.press_moved:
+                self._push_snap(self.drag_snap)     # 拖动完了才记一步撤销
+            self.drag_mode = None
+            self.drag_end = 0
+            self.shape0 = None
+            self._redraw_overlay()
+            if self.sel:
+                self._show_tool()
+            return
+        if self.mode in ("pen", "mosaic", "arrow", "rect", "ellipse"):
+            added = False
+            if self.draw_start and self.pending:
+                sh = self.pending
+                if sh["t"] == "arrow":
+                    if hypot(sh["x2"] - sh["x1"], sh["y2"] - sh["y1"]) > self.px(12):
+                        self.shapes.append(sh)
+                        added = True
+                elif sh["t"] in ("rect", "ellipse"):
+                    # 太小的当误点丢掉，避免屏幕上留下一颗小点
+                    mn = self.px(BOX_MIN_SIZE)
+                    if (abs(sh["x2"] - sh["x1"]) >= mn
+                            and abs(sh["y2"] - sh["y1"]) >= mn):
+                        self.shapes.append(sh)
+                        added = True
+                elif len(sh["pts"]) >= 1:
+                    self.shapes.append(sh)
+                    added = True
+            if added:
+                self._push_snap(self.drag_snap)
+            self.pending = None
+            self.draw_start = None
+            self._redraw_overlay()     # 保持当前工具，可以连续画多笔
+            return
+        if self.mode:
+            return
+        was_new = (self.drag_mode == "new")
+        if self.drag_mode == "move" and self.press_moved:
+            self._push_snap(self.drag_snap)         # 选区带着标注一起移动，可撤销
+        self.dragging = False
+        if not self.press_moved and was_new and self.auto_rect:
+            # 没拖动 = 单击，直接采纳自动识别到的区域
+            self.sel = self.auto_rect
+            self.auto_rect = None
+        self.drag_mode = None
+        self.drag_handle = None
+        self.sel0 = None
+        if self.sel:
+            self.sel = self._clamp_sel(self.sel)
+        if not self.sel or self.sel[2] < self.px(5) or self.sel[3] < self.px(5):
+            self.sel = None
+            self._redraw_overlay()
+            return
+        self._redraw_overlay()
+        self._show_tool()
+        return
+
+    def _ov_dblclick(self, x, y):
+        """双击空白处 = 直接复制成品（点在标注上不算）。"""
+        sh = self._hit_shape(x, y)
+        if sh is None and self.sel and self._in(x, y, self.sel):
+            self._action_copy()             # 双击空白 = 直接复制
+        return
+
+    def _ov_right(self):
+        """右键：逐级退出 —— 退出模式 → 取消选中 → 删最后一笔 → 取消截图。"""
+        if self.mode:
+            self._leave_mode()
+        elif self.sel_shape is not None:
+            self.sel_shape = None
+            self._redraw_overlay()
+            self._refresh_tool()
+        elif self.shapes:
+            self._push_snap(self._snap())      # 右键删最后一笔，也能撤销回来
+            self.shapes.pop()
+            self._redraw_overlay()
+        else:
+            self._cancel_capture()
+        return
+
+    def _ov_escape(self):
+        """Esc：同样逐级退出，与右键的顺序保持一致。"""
+        if self.sel_shape is not None:
+            self.sel_shape = None
+            self._redraw_overlay()
+            self._refresh_tool()
+        elif self.mode:
+            self._leave_mode()
+        else:
+            self._cancel_capture()
+        return
+
+    def _ov_key(self, wp):
+        """其余按键：Delete 删标注、Ctrl+Z/Y 撤销重做、方向键微调。\n\n        返回 True 表示这个键已经被处理掉了，调用方不再往下传。"""
+        ctrl = bool(user32.GetKeyState(VK_CONTROL) & 0x8000)
+        shift = bool(user32.GetKeyState(VK_SHIFT) & 0x8000)
+        if wp == 0x2E and self.sel_shape is not None:      # Delete
+            if self.sel_shape in self.shapes:
+                self._push_snap(self._snap())
+                self.shapes.remove(self.sel_shape)
+            self.sel_shape = None
+            self._redraw_overlay()
+            self._refresh_tool()
+            return True
+        if (wp == 0x59 and ctrl) or (wp == 0x5A and ctrl and shift):
+            self._redo()                                    # Ctrl+Y / Ctrl+Shift+Z
+            return True
+        if (wp == 0x5A and ctrl) or wp == 0x08:
+            self._undo()                                    # Ctrl+Z / Backspace
+            return True
+        # 方向键微调：1px，按住 Shift 是 10px（连续按算一步撤销）
+        if self.sel_shape is not None and wp in (0x25, 0x26, 0x27, 0x28):
+            step = self.px(10) if shift else 1
+            dx = -step if wp == 0x25 else (step if wp == 0x27 else 0)
+            dy = -step if wp == 0x26 else (step if wp == 0x28 else 0)
+            now = time.time()
+            if now - self.nudge_t > 0.8:
+                self._push_snap(self._snap())
+            self.nudge_t = now
+            self._move_shape(self.sel_shape, self._shape_origin(self.sel_shape),
+                             dx, dy)
+            self._redraw_overlay()
+            return True
+        return False
+
     def _cursor_for(self):
+        """按当前模式返回该用的光标（画笔 / 马赛克笔头 / 箭头 / 各种缩放）"""
         if self.mode == "mosaic":
             return self._brush_cursor() or self.hcur_cross     # 马赛克：圆形笔头
         if self.mode == "pen":
@@ -2988,6 +3725,7 @@ class App:
         return self.hcur_cross
 
     def _hit_zone(self, x, y):
+        """判断鼠标在选区哪个部位：outside / inside / 八个手柄名。"""
         if not self.sel:
             return "outside"
         tol = self.px(7)
@@ -2999,6 +3737,7 @@ class App:
         return "outside"
 
     def _clamp_sel(self, sel):
+        """把选区夹在虚拟屏范围内（多屏、副屏在左侧时不能跑到屏幕外）"""
         vsw, vsh = self.vs[2], self.vs[3]
         x, y, ww, hh = sel
         x = max(0, min(x, vsw - 1))
@@ -3008,6 +3747,7 @@ class App:
         return (x, y, ww, hh)
 
     def _move_sel(self, sel0, x, y):
+        """按下的点和当前位置算位移，整体移动选区，标注一起跟着走"""
         dx = x - self.press_pt[0]
         dy = y - self.press_pt[1]
         x0, y0, ww, hh = sel0
@@ -3016,6 +3756,7 @@ class App:
         return (nx, ny, ww, hh)
 
     def _resize_sel(self, sel0, handle, x, y):
+        """拖手柄改选区大小。对角固定，拖过界会自动翻转"""
         x0, y0, ww, hh = sel0
         x1, y1 = x0 + ww, y0 + hh
         minw, minh = self.px(8), self.px(8)
@@ -3030,6 +3771,7 @@ class App:
         return (x0, y0, x1 - x0, y1 - y0)
 
     def _norm(self, a, b):
+        """把任意两个对角点规整成 (x, y, w, h)，并夹在屏幕内"""
         vsw, vsh = self.vs[2], self.vs[3]
         x1, y1 = a
         x2, y2 = b
@@ -3040,6 +3782,7 @@ class App:
         return (min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
 
     def _close_overlay(self):
+        """销毁遮罩、释放缓冲，并把主窗口的内容画回来"""
         if self.hwnd_overlay:
             user32.DestroyWindow(self.hwnd_overlay)
             self.hwnd_overlay = None
@@ -3071,11 +3814,13 @@ class App:
         self.main_was_visible = False
 
     def _cancel_capture(self):
+        """取消截图：收起工具条、关遮罩、恢复主界面"""
         self._close_tool()
         self._close_overlay()
 
-    # ================================================== 标注：文字 / 马赛克 / 箭头
+    # ---------- 标注模式与撤销栈
     def _begin_mode(self, kind):
+        """进入某个标注模式（画笔 / 马赛克 / 箭头 / 方框 / 圆形）"""
         if not self.sel:
             return
         self.mode = kind
@@ -3084,8 +3829,8 @@ class App:
         self.drag_end = 0
         self.pending = None
         self.draw_start = None
-        if kind == "pen":
-            # 画笔只有六色（红蓝绿黄白黑），箭头有七色（多一个灰）。
+        if kind in ("pen", "rect", "ellipse"):
+            # 画笔 / 方框 / 圆形只有六色（红蓝绿黄白黑），箭头有七色（多一个灰）。
             # 从灰色箭头切过来时钳一下，否则会画出一个选项排里根本没有的
             # 颜色，色块全都不高亮，看着像"没选中"。
             self.anno_color = min(self.anno_color, 5)
@@ -3093,6 +3838,7 @@ class App:
         self._refresh_tool()        # 展开颜色/粗细等选项排
 
     def _leave_mode(self):
+        """退出标注模式，回到纯选区状态，并收起工具条选项排"""
         self.mode = None
         self.pending = None
         self.draw_start = None
@@ -3105,7 +3851,11 @@ class App:
         self._show_tool()
 
     def _snap(self):
-        """把标注列表拍成可比较、可回放的快照（不带 _bb / _cells 这类缓存）"""
+        """把标注列表拍成可比较、可回放的快照。
+
+        只存数据（t / 坐标 / 颜色…），不存任何渲染缓存 —— 缓存现在都放在
+        App 上，标注字典里已经没有任何下划线开头的键；这里跳过 `_` 开头
+        只是兜底，防止以后有人往里塞临时字段。"""
         out = []
         for sh in self.shapes:
             d = {}
@@ -3117,6 +3867,7 @@ class App:
         return out
 
     def _push_snap(self, snap):
+        """把一份标注快照压进撤销栈。变化太小的不算一步（避免墨迹没干就占满栈）"""
         if snap is None:
             return
         self.undo_stack.append(snap)
@@ -3125,6 +3876,7 @@ class App:
         self.redo_stack.clear()
 
     def _undo(self):
+        """撤销一步（Ctrl+Z）"""
         if not self.undo_stack:
             return
         self.redo_stack.append(self._snap())
@@ -3134,6 +3886,7 @@ class App:
         self._refresh_tool()
 
     def _redo(self):
+        """重做一步（Ctrl+Y）"""
         if not self.redo_stack:
             return
         self.undo_stack.append(self._snap())
@@ -3143,10 +3896,15 @@ class App:
         self._refresh_tool()
 
     def _sync_opts(self, sh):
-        """把选中标注当前的样式同步到工具条（只有箭头可选中）"""
-        if sh.get("t") == "arrow":
+        """把选中标注当前的样式同步到工具条（箭头 / 方框 / 圆形可选中）"""
+        t = sh.get("t")
+        if t in ("arrow", "rect", "ellipse"):
             self.anno_color = max(0, min(sh.get("color", 0), len(ANNO_COLORS) - 1))
-            return
+        if t in ("rect", "ellipse"):
+            # 线宽是像素值，映射回「细 / 中 / 粗」里最接近的一档，工具条才不会两个都不亮
+            w = float(sh.get("w") or self._pen_w())
+            self.pen_width = min(range(len(PEN_WIDTHS)),
+                                 key=lambda i: abs(self.px(PEN_WIDTHS[i]) - w))
 
     def _apply_opts(self):
         """工具条上的颜色 / 粗细改动，立刻作用到当前画笔（或选中的箭头）"""
@@ -3161,9 +3919,18 @@ class App:
                 self._push_snap(pre)
             self._redraw_overlay()
             return
+        if sh.get("t") in ("rect", "ellipse"):
+            # 方框 / 圆形还能改线宽
+            sh["color"] = self.anno_color
+            sh["w"] = self._pen_w()
+            if self._snap() != pre:
+                self._push_snap(pre)
+            self._redraw_overlay()
+            return
         self._redraw_overlay()
 
     def _update_pending(self, x, y):
+        """拖动中实时更新临时标注。松手时才把 pending 真正落到 shapes 里"""
         if not self.draw_start:
             return
         # 笔画一律收进选区，避免涂到框外
@@ -3195,22 +3962,31 @@ class App:
         if self.mode == "arrow":
             self.pending = {"t": "arrow", "x1": x0, "y1": y0, "x2": x,
                             "y2": y, "color": self._color_idx()}
+            return
+        if self.mode in ("rect", "ellipse"):
+            if self.pending is None:
+                self.pending = {"t": self.mode, "x1": x0, "y1": y0, "x2": x, "y2": y,
+                                "color": self._color_idx(), "w": self._pen_w()}
+            else:
+                self.pending["x2"], self.pending["y2"] = x, y
 
     def _clamp_to_sel(self, x, y):
+        """把坐标夹进选区：标注不许画到选区外面"""
         if not self.sel:
             return x, y
         sx, sy, sw_, sh_ = self.sel
         return (max(sx + 2, min(x, sx + sw_ - 2)),
                 max(sy + 2, min(y, sy + sh_ - 2)))
 
-    # ================================================== 工具条
+    # ================================================== 7. 浮动工具条 —— 版式 / 毛玻璃 / 绘制 / 点击
     def _opt_visible(self):
-        return (self.mode in ("pen", "arrow", "mosaic")
+        """是否需要显示选项排（第二排：颜色 / 粗细 / 笔头 / 块大小）"""
+        return (self.mode in ("pen", "arrow", "mosaic", "rect", "ellipse")
                 or self._arrow_opts())
 
     def _pen_opts(self):
-        """画笔模式：颜色 + 粗细两排"""
-        return self.mode == "pen"
+        """颜色 + 粗细两排：画笔、方框、圆形共用同一组选项"""
+        return self.mode in ("pen", "rect", "ellipse")
 
     def _arrow_opts(self):
         """选中箭头时只露出颜色点（箭头可改颜色）"""
@@ -3222,71 +3998,75 @@ class App:
         return self._pen_opts() or self._arrow_opts() or self.mode == "arrow"
 
     def _mosaic_opts(self):
+        """马赛克模式特有的两排选项：笔头 + 块大小"""
         return self.mode == "mosaic"
 
     def _tool_layout(self):
         """返回 (组宽, 组高, 矩形列表)。按钮彼此独立，之间留空隙。
         矩形第 5 项之后是“选项排”（颜色 / 粗细等），对应模式出现。"""
-        bw, bh = self.px(80), self.px(44)
-        gap = self.px(6)
+        bw, bh = self.tb(TB_BTN_W), self.tb(TB_BTN_H)
+        gap = self.tb(TB_BTN_GAP)
         n = len(TB_ITEMS)
         ww = bw * n + gap * (n - 1)
         rects = [("@btn", i * (bw + gap), 0, bw, bh) for i in range(n)]
         hh = bh
         if self._opt_visible():
-            oy = bh + self.px(8)
-            oh = self.px(40)
-            cx = self.px(8)
+            oy = bh + self.tb(8)
+            oh = self.tb(40)
+            cx = self.tb(8)
             if self._color_opts():
-                d = self.px(26)
+                d = self.tb(26)
                 ncolors = 6 if self._pen_opts() else len(ANNO_COLORS)
                 for i in range(ncolors):
                     rects.append(("@color%d" % i, cx, oy + (oh - d) / 2.0, d, d))
-                    cx += d + self.px(7)
-                cx += self.px(10)
+                    cx += d + self.tb(7)
+                cx += self.tb(10)
             if self._pen_opts():
-                lw = self.px(46)
-                cw = self.px(44)
+                lw = self.tb(46)
+                cw = self.tb(44)
                 rects.append(("@label_p", cx, oy, lw, oh))
-                cx += lw + self.px(2)
+                cx += lw + self.tb(2)
                 for i in range(len(PEN_WIDTHS)):
                     rects.append(("@penw%d" % i, cx, oy, cw, oh))
-                    cx += cw + self.px(5)
+                    cx += cw + self.tb(5)
             if self._mosaic_opts():
-                lw = self.px(46)
-                cw = self.px(44)
+                lw = self.tb(46)
+                cw = self.tb(44)
                 rects.append(("@label_b", cx, oy, lw, oh))
-                cx += lw + self.px(2)
+                cx += lw + self.tb(2)
                 for i in range(len(MOSAIC_BRUSHES)):
                     rects.append(("@brush%d" % i, cx, oy, cw, oh))
-                    cx += cw + self.px(5)
-                cx += self.px(16)
+                    cx += cw + self.tb(5)
+                cx += self.tb(16)
                 rects.append(("@label_k", cx, oy, lw, oh))
-                cx += lw + self.px(2)
+                cx += lw + self.tb(2)
                 for i in range(len(MOSAIC_BLOCKS)):
                     rects.append(("@block%d" % i, cx, oy, cw, oh))
-                    cx += cw + self.px(5)
+                    cx += cw + self.tb(5)
             hh = oy + oh
         return ww, hh, rects
 
     def _show_tool(self):
+        """按选区位置把工具条摆好并显示。
+
+        优先浮在选区下方、水平居中；贴到屏幕边缘时自动往里收，不会跑出屏幕。"""
         if not self.sel:
             self._close_tool()
             return
         ww, hh, rects = self._tool_layout()
         vsx, vsy, vsw, vsh = self.vs
         sx, sy, sw_, sh_ = self.sel
-        gap = self.px(10)
+        gap = self.tb(10)
 
         # 水平居中于选区，浮在选区下方
         px_ = vsx + sx + int(round((sw_ - ww) / 2.0))
         py_ = vsy + sy + sh_ + gap
-        if py_ + hh > vsy + vsh - self.px(6):
+        if py_ + hh > vsy + vsh - self.tb(6):
             py_ = vsy + sy - hh - gap          # 下方放不下就翻到上方
-        if py_ < vsy + self.px(6):
-            py_ = min(vsy + vsh - hh - self.px(6), vsy + sy + sh_ + gap)
-        px_ = max(vsx + self.px(6), min(px_, vsx + vsw - ww - self.px(6)))
-        py_ = max(vsy + self.px(6), min(py_, vsy + vsh - hh - self.px(6)))
+        if py_ < vsy + self.tb(6):
+            py_ = min(vsy + vsh - hh - self.tb(6), vsy + sy + sh_ + gap)
+        px_ = max(vsx + self.tb(6), min(px_, vsx + vsw - ww - self.tb(6)))
+        py_ = max(vsy + self.tb(6), min(py_, vsy + vsh - hh - self.tb(6)))
         self.tb_pos = (px_, py_)
 
         topmost = w.HWND(HWND_TOPMOST)
@@ -3321,6 +4101,7 @@ class App:
                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
 
     def _close_tool(self):
+        """关掉并销毁工具条窗口"""
         if self.hwnd_tool:
             user32.DestroyWindow(self.hwnd_tool)
             self.hwnd_tool = None
@@ -3339,6 +4120,9 @@ class App:
         return (ww, hh, tuple(rects))
 
     def _ensure_tool_surface(self):
+        """确保工具条的绘制表面、蒙版与当前布局一致。
+
+        布局签名变了就整套重建 —— 只看宽高是不够的，见 _tool_layout_key。"""
         key = self._tool_layout_key()
         if self.tb_dc and self.tb_key == key:
             return
@@ -3364,6 +4148,7 @@ class App:
         self.tb_alpha = bytes(min(255, v * TB_ALPHA // 255) for v in self.tb_mask)
 
     def _release_tool_surface(self):
+        """释放工具条表面，并作废与布局绑定的玻璃底缓存"""
         if self.tb_dc:
             if self.tb_old:
                 gdi32.SelectObject(self.tb_dc, self.tb_old)
@@ -3390,7 +4175,7 @@ class App:
         现在还要往外放一圈 pad：颜色点选中时的白色高亮环画在圆点矩形之外，
         蒙版卡死在矩形上会把环切成四段硬边（这就是“选中高亮还有锯齿”的原因）。"""
         _, _, rects = self._tool_layout()
-        pad = int(self.px(6))
+        pad = int(self.tb(6))
         mask = bytearray(W * H)
         for (_n, x0, y0, ww, hh) in rects:
             xa = max(0, int(x0) - pad)
@@ -3418,14 +4203,11 @@ class App:
         sdc = self._get_screen_dc()
         d = _new_dib(sdc, W, H)
         try:
-            g = GFX(d[0])
-            try:
+            with GFX(d[0]) as g:
                 for (name, x, y, ww, hh) in self._tool_layout()[2]:
                     if name != "@btn":
                         continue
-                    g.fill_round(0xFFFFFFFF, x, y, ww, hh, self.px(12))
-            finally:
-                g.close()
+                    g.fill_round(0xFFFFFFFF, x, y, ww, hh, self.tb(12))
             cov = bytes(ctypes.string_at(d[3], W * H * 4)[3::4])
         finally:
             _free_dib(d)
@@ -3509,9 +4291,8 @@ class App:
         else:
             ctypes.memset(self.tb_bits, 0, total)
 
-        g = GFX(self.tb_dc)
-        self._draw_tool(g, W, H)
-        g.close()
+        with GFX(self.tb_dc) as g:
+            self._draw_tool(g, W, H)
 
         raw = ctypes.string_at(self.tb_bits, total)
         ba = bytearray(raw)
@@ -3547,13 +4328,15 @@ class App:
 
     def _paint_tool(self, hwnd):
         # ULW 负责全部呈现，这里只清掉重绘请求
+        """响应工具条的 WM_PAINT：呈现全靠 ULW，这里只清掉重绘请求"""
         ps = PAINTSTRUCT()
         user32.BeginPaint(hwnd, byref(ps))
         user32.EndPaint(hwnd, byref(ps))
 
     def _draw_tool(self, g, W, H):
+        """画工具条：十颗按钮 + 选项排（颜色 / 粗细 / 笔头 / 块大小）"""
         _, _, rects = self._tool_layout()
-        rad = self.px(12)
+        rad = self.tb(12)
         nb = len(TB_ITEMS)
         for i in range(nb):
             _, x, y, ww, hh = rects[i]
@@ -3581,45 +4364,67 @@ class App:
             g.stroke_round(0x33FFFFFF if hot else 0x1FFFFFFF, 1,
                            x + 0.5, y + 0.5, ww - 1, hh - 1, rad)
 
-            isz = self.px(17)
-            self._draw_tool_icon(g, kind, x + self.px(13),
-                                 y + (hh - isz) / 2.0, isz, ic, bg)
-            g.text(label, self.px(12), tc,
-                   x + self.px(35), y, ww - self.px(35) - self.px(3), hh, 0, hot)
+            # 居中算法：先把「图标墨迹 + 缝 + 文字墨迹」当成一块，让它左右
+            # 留白相等；再把图标按它自己的墨迹边界摆进去。
+            # 直接用固定坐标或按方框算，两字标签右边会空出十几像素（看着就是
+            # 没居中），「取消」的 × 又会因为墨迹小 4px 而偏右。
+            isz = self.tb(TB_ICON_SIZE)
+            fs = self.tb_font(12)
+            s = isz / float(TB_ICON_SIZE)          # 表按 17px 量的，按实际缩放
+            il, it, ir, ib = TB_ICON_INK[kind]
+            iw = (ir - il + 1) * s                 # 图标墨迹宽
+            ih = (ib - it + 1) * s                 # 图标墨迹高
+            adv, _ = g.measure(label, fs)
+            sl = self.tb(TB_TEXT_SIDE_L)
+            sr = self.tb(TB_TEXT_SIDE_R)
+            ink_w = adv - sl - sr                  # 文字墨迹宽
+            gap = self.tb(TB_ICON_GAP)
+            bx = x + (ww - (iw + gap + ink_w)) / 2.0     # 图标墨迹左端
+            tx = bx + iw + gap - sl                      # 文字框左边（减去左留白）
+            self._draw_tool_icon(g, kind, bx - il * s,
+                                 y + (hh - ih) / 2.0 - it * s, isz, ic, bg)
+            # 文字框右边界一直给到按钮右边缘（不是正好 ink_w）：DrawString 的
+            # 矩形差一点点就会把「马赛克」折成两行，多留空间最稳。
+            g.text(label, fs, tc, tx, y + self.tb(TB_TEXT_DY),
+                   x + ww - tx, hh, 0, hot)
 
         # 选项排：颜色  ·  画笔粗细 / 马赛克笔头 / 块大小
+        # 这里的文字都要加 TB_TEXT_DY 补偿，原因见常量区注释（GDI+ 行内居中
+        # 会让中文字形整体偏上，和旁边按钮里的文字不在一条线上）。
         if not self._opt_visible():
             return
+        tdy = self.tb(TB_TEXT_DY)
         for i in range(nb, len(rects)):
             name, x, y, ww, hh = rects[i]
             if name in ("@label_b", "@label_k", "@label_p"):
                 txt = {"@label_b": "笔头", "@label_k": "块大小", "@label_p": "粗细"}[name]
-                g.text(txt, self.px(11.5), C_TB_TXT, x, y, ww, hh, 1)
+                g.text(txt, self.tb_font(11.5), C_TB_TXT, x, y + tdy, ww, hh, 1)
             elif name.startswith("@penw"):
                 k = int(name[5:])
                 on = (self.pen_width == k)
-                g.fill_round(C_ACCENT if on else C_TB_BTN, x, y, ww, hh, self.px(9))
+                g.fill_round(C_ACCENT if on else C_TB_BTN, x, y, ww, hh, self.tb(9))
                 if not on:
                     g.stroke_round(0x1FFFFFFF, 1, x + 0.5, y + 0.5,
-                                   ww - 1, hh - 1, self.px(9))
-                g.text(PEN_WIDTH_NAMES[k], self.px(13),
-                       C_WHITE if on else C_TB_TXT, x, y, ww, hh, 1, on)
+                                   ww - 1, hh - 1, self.tb(9))
+                g.text(PEN_WIDTH_NAMES[k], self.tb_font(13),
+                       C_WHITE if on else C_TB_TXT, x, y + tdy, ww, hh, 1, on)
             elif name.startswith("@brush") or name.startswith("@block"):
                 is_brush = name.startswith("@brush")
                 k = int(name[6:])
                 on = (self.mosaic_brush == k) if is_brush else (self.mosaic_block == k)
-                g.fill_round(C_ACCENT if on else C_TB_BTN, x, y, ww, hh, self.px(9))
+                g.fill_round(C_ACCENT if on else C_TB_BTN, x, y, ww, hh, self.tb(9))
                 if not on:
                     g.stroke_round(0x1FFFFFFF, 1, x + 0.5, y + 0.5,
-                                   ww - 1, hh - 1, self.px(9))
+                                   ww - 1, hh - 1, self.tb(9))
                 txt = MOSAIC_BRUSH_NAMES[k] if is_brush else MOSAIC_BLOCK_NAMES[k]
-                g.text(txt, self.px(13), C_WHITE if on else C_TB_TXT, x, y, ww, hh, 1, on)
+                g.text(txt, self.tb_font(13), C_WHITE if on else C_TB_TXT,
+                       x, y + tdy, ww, hh, 1, on)
             else:
                 k = int(name[6:])
                 c = ANNO_COLORS[k]
                 on = (self.anno_color == k)
                 if on:
-                    m = self.px(3)
+                    m = self.tb(3)
                     g.fill_round(0xFFFFFFFF, x - m, y - m, ww + m * 2, hh + m * 2,
                                  (ww + m * 2) / 2.0)
                 g.fill_round(0xFF000000 | (c & 0xFFFFFF), x, y, ww, hh, ww / 2.0)
@@ -3628,7 +4433,7 @@ class App:
 
     def _draw_tool_icon(self, g, kind, x, y, sz, color, bg=None):
         """15×15 单位网格上的线条图标，按 sz 缩放"""
-        lw = max(1.15, self.px(1.35))
+        lw = max(1.15, self.tb(1.35))
         u = sz / 15.0
 
         def L(x1, y1, x2, y2):
@@ -3681,6 +4486,22 @@ class App:
                 (x + tipx * u, y + tipy * u),
                 (x + (bx_ + nx_ * hw_) * u, y + (by_ + ny_ * hw_) * u),
                 (x + (bx_ - nx_ * hw_) * u, y + (by_ - ny_ * hw_) * u)])
+        elif kind == "rect":
+            # 方框：四角闭合的细框（圆头线段，四角不留缺口）
+            lw2 = max(1.15, self.tb(1.35))
+
+            def LR(x1, y1, x2, y2):
+                g.line(color, lw2, x + x1 * u, y + y1 * u,
+                       x + x2 * u, y + y2 * u, 2)
+
+            LR(1.9, 3.4, 13.1, 3.4)
+            LR(13.1, 3.4, 13.1, 11.6)
+            LR(13.1, 11.6, 1.9, 11.6)
+            LR(1.9, 11.6, 1.9, 3.4)
+        elif kind == "ellipse":
+            # 圆形：空心椭圆，跟实际画出来的一致
+            g.stroke_ellipse(color, max(1.15, self.tb(1.35)),
+                             x + 1.7 * u, y + 3.4 * u, 11.6 * u, 8.2 * u)
         elif kind == "undo":
             # 逆时针回环箭头：从右上起，绕顶部回到左下，箭头在末端指向左下。
             # （角度在本窗口坐标里增大 = 顺时针，所以这里用递减才是逆时针）
@@ -3711,6 +4532,7 @@ class App:
             L(11.8, 3.2, 3.2, 11.8)
 
     def _on_tool(self, hwnd, msg, wp, lp):
+        """工具条窗口过程：悬停高亮、点击派发、鼠标移出时的清理"""
         if msg == WM_PAINT:
             self._paint_tool(hwnd)
             return 0
@@ -3799,7 +4621,7 @@ class App:
             return 0
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
-    # ================================================== 动作
+    # ================================================== 8. 成品输出与系统集成
     def _render_result(self):
         """裁出选区（含文字标注），返回 (BGRA buffer, w, h)"""
         if not self.sel or not self.dc_shot or not self.hdc_screen:
@@ -3821,9 +4643,8 @@ class App:
         old = gdi32.SelectObject(dc, bmp)
         gdi32.BitBlt(dc, 0, 0, ww, hh, self.dc_shot, x, y, SRCCOPY)
         if self.shapes:
-            g = GFX(dc)
-            self._draw_shapes(g, -x, -y, False)   # 不把选框虚线烤进成品
-            g.close()
+            with GFX(dc) as g:
+                self._draw_shapes(g, -x, -y, False)   # 不把选框虚线烤进成品
         raw = ctypes.string_at(bits, ww * hh * 4)
         gdi32.SelectObject(dc, old)
         gdi32.DeleteDC(dc)
@@ -3832,6 +4653,7 @@ class App:
         return ctypes.create_string_buffer(raw, len(raw)), ww, hh
 
     def _action_copy(self):
+        """复制成品到剪贴板（CF_DIB 格式，能直接粘进微信、Word 等）"""
         buf, ww, hh = self._render_result()
         if not buf:
             return
@@ -3874,6 +4696,7 @@ class App:
         self._show_tool()
 
     def _action_save(self):
+        """另存为 PNG"""
         buf, ww, hh = self._render_result()
         if not buf:
             return
@@ -3904,12 +4727,14 @@ class App:
         self._balloon("已保存", os.path.basename(path))
 
     def _pictures_dir(self):
+        """默认保存目录：用户目录下的「图片」文件夹，没有就退到桌面"""
         d = os.path.join(os.path.expanduser("~"), "Pictures")
         if not os.path.isdir(d):
             d = os.path.expanduser("~")
         return d
 
     def _save_dialog(self, owner, folder, default):
+        """弹系统「另存为」对话框，返回用户选的完整路径（取消返回 None）"""
         ofn = OPENFILENAMEW()
         ofn.lStructSize = sizeof(OPENFILENAMEW)
         ofn.hwndOwner = owner
@@ -3928,8 +4753,9 @@ class App:
             return buf.value
         return None
 
-    # ================================================== 托盘 & 热键
+    # ---------- 托盘 / 热键 / 开机自启
     def _make_icon(self):
+        """画托盘图标：圆角方块 + 白色取景框，32×32 带 alpha 通道"""
         S = 32
         buf = ctypes.create_string_buffer(S * S * 4)   # 全 0 → 透明背景
         img = P()
@@ -3977,6 +4803,7 @@ class App:
         return hicon
 
     def create_tray(self):
+        """把图标放进系统托盘（右键菜单、悬停提示都靠它）"""
         self.hicon = self._make_icon()
         nid = self.tray
         nid.cbSize = sizeof(NOTIFYICONDATAW)
@@ -3989,6 +4816,7 @@ class App:
         shell32.Shell_NotifyIconW(0, byref(nid))
 
     def _update_tray_tip(self):
+        """刷新托盘的悬停提示，把当前快捷键显示出来"""
         nid = NOTIFYICONDATAW()
         nid.cbSize = sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd_main
@@ -3998,6 +4826,7 @@ class App:
         shell32.Shell_NotifyIconW(1, byref(nid))   # NIM_MODIFY
 
     def _balloon(self, title, text):
+        """弹一个托盘气泡通知（改快捷键成功、出错提示都用它）"""
         nid = NOTIFYICONDATAW()
         nid.cbSize = sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd_main
@@ -4009,6 +4838,7 @@ class App:
         shell32.Shell_NotifyIconW(1, byref(nid))
 
     def _on_tray_msg(self, lp):
+        """托盘图标消息：右键弹菜单，左键单击直接开始截图"""
         if lp == WM_RBUTTONUP or lp == WM_RBUTTONDOWN:
             if lp == WM_RBUTTONUP:
                 self._tray_menu()
@@ -4018,6 +4848,7 @@ class App:
             self.start_capture()
 
     def _tray_menu(self):
+        """弹托盘右键菜单：改快捷键 / 开机启动 / 退出"""
         pt = w.POINT()
         user32.GetCursorPos(byref(pt))
         hm = user32.CreatePopupMenu()
@@ -4051,11 +4882,15 @@ class App:
     RUN_NAME = "SnapLite"
 
     def _launch_command(self):
+        """取「怎么启动自己」的命令行。
+
+        打包后是 exe 路径，开发时是 python + 脚本路径 —— 开机启动要写进注册表。"""
         if getattr(sys, "frozen", False):
             return '"%s"' % sys.executable
         return '"%s" "%s"' % (sys.executable, os.path.abspath(__file__))
 
     def autostart_enabled(self):
+        """是否已设成开机启动（读注册表 Run 键）"""
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.RUN_KEY) as k:
                 v, _ = winreg.QueryValueEx(k, self.RUN_NAME)
@@ -4066,6 +4901,10 @@ class App:
             return False
 
     def set_autostart(self, on):
+        """开 / 关开机启动。
+
+        用 CreateKey 而不是 OpenKey：全新系统上 Run 键可能还不存在，
+        OpenKey 会直接失败，用户就永远设不上开机启动。"""
         try:
             # 用 CreateKey 而不是 OpenKey：Run 键在全新系统上可能还不存在，
             # OpenKey 会抛 FileNotFoundError 被下面的 except 吞掉，
@@ -4084,6 +4923,7 @@ class App:
             self._balloon("设置失败", "无法写入当前用户的启动项")
 
     def quit(self):
+        """退出：注销热键、移除托盘图标、卸钩子、释放全部缓冲"""
         try:
             shell32.Shell_NotifyIconW(2, byref(self.tray))
         except Exception:
@@ -4115,8 +4955,9 @@ class App:
         if self.hwnd_main:
             user32.DestroyWindow(self.hwnd_main)
 
-    # ================================================== 主循环
+    # ---------- 主循环
     def run(self):
+        """程序主循环：建窗口 → 装托盘 → 注册热键 → 跑消息循环"""
         self.create_main()
         self.create_tray()
         self._register_hotkey()
@@ -4135,6 +4976,7 @@ class App:
 
 
 def main():
+    """程序入口。单实例检查：已经有一个在跑就直接把它的窗口叫到前面"""
     try:
         try:
             if SetProcessDpiAwarenessContext is not None:

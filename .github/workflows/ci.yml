@@ -48,6 +48,21 @@ jobs:
       - name: 画笔视觉验证（像素级）
         run: python tests/test_pen_visual.py
 
+      - name: 方框 / 圆形标注测试
+        run: python tests/test_shapes.py
+
+      - name: 遮罩消息交互测试
+        run: python tests/test_overlay_msgs.py
+
+      - name: 工具条图标文字居中（像素级）
+        run: python tests/test_tb_center.py
+
+      - name: 标注渲染（箭头/方框/圆形/马赛克，像素级）
+        run: python tests/test_anno_render.py
+
+      - name: 主面板交互（hover/点 ✕/拖窗口/按键）
+        run: python tests/test_main_panel.py
+
       - name: 生成界面截图（校验渲染管线可用）
         run: |
           python tools/make_screenshot.py
