@@ -32,3 +32,7 @@ assets/tool_glass.png
 .DS_Store
 Thumbs.db
 assets/_dbg_*.png
+
+# 发布流程的临时文件
+.release_id
+.exe_sha
