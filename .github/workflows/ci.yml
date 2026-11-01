@@ -51,6 +51,9 @@ jobs:
       - name: 方框 / 圆形标注测试
         run: python tests/test_shapes.py
 
+      - name: 工具条按钮点击派发（真实窗口消息）
+        run: python tests/test_tool_click.py
+
       - name: 遮罩消息交互测试
         run: python tests/test_overlay_msgs.py
 

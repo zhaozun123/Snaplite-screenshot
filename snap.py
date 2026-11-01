@@ -619,6 +619,10 @@ TB_ITEMS = (("reselect", "重选"), ("pen", "画笔"), ("mosaic", "马赛克"),
             ("arrow", "箭头"), ("rect", "方框"), ("ellipse", "圆形"),
             ("undo", "撤销"), ("copy", "复制"),
             ("save", "保存"), ("cancel", "取消"))
+# TB_ITEMS 里所有"绘图类"工具的 kind。这类按钮的行为统一是「点一次进入、
+# 再点一次退出」，由 _on_tool 里同一段逻辑处理。加新绘图工具时必须同时
+# 加进这里，否则 _on_tool 认不出它，会掉进兜底分支（曾导致点方框直接取消截图）。
+ANNO_KINDS = ("pen", "mosaic", "arrow", "rect", "ellipse")
 
 # 方框 / 圆形：拖动两个对角画出来；选中后拖四角改大小
 BOX_HANDLE_R = 5          # 角上手柄半径
@@ -4604,7 +4608,11 @@ class App:
                     self.undo_stack.clear()
                     self.redo_stack.clear()
                     self._redraw_overlay()
-                elif kind in ("pen", "mosaic", "arrow"):
+                elif kind in ANNO_KINDS:
+                    # 再点一次同一个工具 = 退出该模式。这里必须穷举 TB_ITEMS
+                    # 里所有"绘图类"工具：漏掉哪个，点它就会掉到下面的分支，
+                    # 而兜底是取消截图（v1.3.0 就漏了 rect/ellipse，点方框直接
+                    # 退出截图）。新增工具时同步 ANNO_KINDS，别只改 TB_ITEMS。
                     if self.mode == kind:
                         self._leave_mode()
                     else:
@@ -4615,8 +4623,9 @@ class App:
                     self._action_copy()
                 elif kind == "save":
                     self._action_save()
-                else:
+                elif kind == "cancel":
                     self._cancel_capture()
+                # 其余未知 kind 一律不响应：宁可点了没反应，也不能误取消截图
                 return 0
             return 0
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
