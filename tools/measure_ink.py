@@ -30,13 +30,18 @@ except Exception:
     pass
 
 SZ = 17          # 与 TB_ICON_SIZE 一致
-BOX = 40         # 测量画布比图标大一圈，避免贴边被裁
-FS = 12.0
+BOX = 72         # 测量画布。必须大于最宽的标签「马赛克」（14px 下推进 47.9），
+                 # 原来用 40 会把它裁掉，量出来的墨迹宽只有 26、右侧留白 18.9。
 
 app = snap.App()
 app.create_main()
 app._build_capture_buffers()
 sdc = app._get_screen_dc()
+
+# 用「当前 TB_FONT_SCALE 落在屏幕上的真实像素字号」量，而不是写死 12px。
+# 否则一改字号，TB_TEXT_SIDE 就过期 —— 字号变了字形两侧的空白会跟着变，
+# 沿用旧值会让图标+文字整块偏离中线（v1.3.0 放大到 14px 时就偏了 2px）。
+FS = float(app.tb_font(12))
 
 
 def ink_of(draw):
@@ -70,7 +75,9 @@ print("}")
 
 print()
 print("# 文字墨迹：相对文字框 (0,0) 的左偏移与宽度 —— 用来核对 TB_TEXT_SIDE")
-print("# %-8s %8s %8s %8s %8s" % ("标签", "推进宽", "墨迹左", "墨迹宽", "两侧留白和"))
+print("# 当前字号 %.0fpx（TB_FONT_SCALE=%.2f）" % (FS, snap.TB_FONT_SCALE))
+print("# %-8s %8s %8s %8s %8s" % ("标签", "推进宽", "墨迹左", "墨迹宽", "右侧留白"))
+lefts, rights = [], []
 gm = GFX(sdc)
 for kind, label in TB_ITEMS:
     adv, _ = gm.measure(label, FS)
@@ -78,8 +85,20 @@ for kind, label in TB_ITEMS:
     if box is None:
         continue
     l, t, r, b = box
-    print("  %-8s %8.1f %8d %8d %8.1f"
-          % (label, adv, l, r - l + 1, adv - (r - l + 1)))
+    right = adv - (r + 1)
+    lefts.append(l)
+    rights.append(right)
+    print("  %-8s %8.1f %8d %8d %8.1f" % (label, adv, l, r - l + 1, right))
 gm.close()
+
+# 取中位数：个别标签（如单字「×」）side bearing 偏得远，平均值会被拉跑
+if lefts:
+    lefts.sort(); rights.sort()
+    ml = lefts[len(lefts) // 2]
+    mr = rights[len(rights) // 2]
+    print()
+    print("# 建议值（中位数）—— 逻辑值 = 实测像素 / TB_SCALE，因为 tb() 会再乘一次")
+    print("TB_TEXT_SIDE_L = %.2f     # 实测 %dpx" % (ml / snap.TB_SCALE, ml))
+    print("TB_TEXT_SIDE_R = %.2f     # 实测 %dpx" % (mr / snap.TB_SCALE, mr))
 
 user32.DestroyWindow(app.hwnd_main)
