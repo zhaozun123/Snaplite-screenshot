@@ -148,7 +148,7 @@ python -m PyInstaller SnapLite.spec --noconfirm --clean
 
 ```
 snap.py              主程序（全部功能都在这一个文件里）
-ARCHITECTURE.md      代码结构说明：八段职责、改什么去哪里、二十六个必知坑、自测清单
+ARCHITECTURE.md      代码结构说明：八段职责、改什么去哪里、二十七个必知坑、自测清单
 SnapLite.spec        PyInstaller 打包配置
 make_ico.py          生成 app.ico（纯 BMP/AND 掩码，兼容各版本资源管理器）
 app.ico              程序图标
@@ -164,7 +164,7 @@ tests/
   test_panel_menu.py    主面板右键菜单：只在 logo 上弹、菜单项读回核对、菜单开着时不抓屏
   test_glass_follow.py  玻璃底跟随：背景在变时必须换，没变时一帧都不多算
   test_glass_live_thread.py  活跃档后台线程：起停 / 静止收工 / 让路 / 帧不堆积
-  test_glass_guard.py       抓屏属性的归属 / 抓到自己不上屏 / 拖动不吃脏帧
+  test_glass_guard.py       抓屏属性的归属 / 抓到自己不上屏 / 拖动不吃脏帧 / 快照对齐
   test_blur_edge.py         模糊不许吃「图外」：纯灰图模糊后四边必须与中心同亮度
   test_robust.py            托盘重建 / 单实例 / 改分辨率 / 日志上限
   test_overlay_msgs.py  遮罩消息：框选 / 移动 / 改大小 / 标注 / 方向键 / 右键与 Esc 逐级退出
