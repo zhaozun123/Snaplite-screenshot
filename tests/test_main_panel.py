@@ -208,6 +208,89 @@ send(hwnd, WM_LBUTTONDOWN, 1, pack(*center(pin)))
 check("收回到不置顶，不留状态给后面的检查",
       (not app.topmost) and (not ex_topmost()))
 
+# ---------- 13. 黑帧不能上屏
+# 抓屏是整条链路上唯一「失败了也不作声」的环节：BitBlt 对没画上的区域不报错，
+# 而 grab_screen 每次都新建位图（新建出来就是全黑）。模糊链路同样不看 GDI+
+# 的返回码，黑进黑出，末尾还把 alpha 强制成 255。不拦的话，屏幕上就是面板
+# 整块 (8,9,12)、250ms 后又自己变回来 —— 就是用户报的「直接黑了又变回来」。
+print("\n=== 13. 黑帧闸门 ===")
+import time as _time
+
+_logged = []
+_real_write_log = snap._write_log
+snap._write_log = lambda path, text: _logged.append((path, text))
+
+
+def blank_luma():
+    """离屏表面里「面板空白处」的平均亮度。这块区域只有玻璃底和压暗层，
+    所以它能直接反映这一帧用的是哪张玻璃底。"""
+    W, H = app.MW, app.MH
+    raw = ctypes.string_at(app.mn_bits, W * H * 4)
+    tot = cnt = 0
+    for yy in range(136, H - 8):
+        for xx in range(26, W - 26):
+            o = (yy * W + xx) * 4
+            tot += raw[o] + raw[o + 1] + raw[o + 2]
+            cnt += 3
+    return tot / float(cnt) if cnt else 0.0
+
+
+W, H = app.MW, app.MH
+total_bytes = W * H * 4
+
+# 三通道平均，不能只采一个通道：深红/深黄背景的 B 通道本来就接近 0，
+# 只看 B 会把正常画面判成黑帧 —— 那样闸门就成了「随机冻住面板」。
+red = bytearray(total_bytes)
+for _i in range(0, total_bytes, 4):
+    red[_i + 2] = 200          # R
+    red[_i + 3] = 255
+check("深红背景不会被当成黑帧", snap._frame_luma(bytes(red), W, H) > 60,
+      "luma=%.1f" % snap._frame_luma(bytes(red), W, H))
+
+app._refresh_glass(blank=False)          # 先拿到一帧真实背景当基准
+app._present_main()
+base = blank_luma()
+check("基准帧正常（有背景可看）", base > 5, "luma=%.1f" % base)
+
+app.mn_glass = bytes(total_bytes)        # 注入一整块纯黑（等价于抓屏抓黑）
+app._present_main()
+check("黑帧被拦下，画面保持上一帧", abs(blank_luma() - base) < 4,
+      "before=%.1f after=%.1f" % (base, blank_luma()))
+check("mn_glass 同时回退，不给下一次重绘留黑底",
+      snap._frame_luma(app.mn_glass, W, H) > 5,
+      "mn_glass luma=%.1f" % snap._frame_luma(app.mn_glass, W, H))
+
+app.mn_glass = bytes(total_bytes)
+app._present_main()
+check("连续第二帧黑照样拦", abs(blank_luma() - base) < 4,
+      "luma=%.1f" % blank_luma())
+
+check("坏帧写了一条现场日志",
+      any(p == snap.GLASS_LOG for p, _ in _logged),
+      "共 %d 条" % len(_logged))
+check("日志里同时记了原始帧和玻璃底的亮度（用来区分是抓屏黑还是模糊黑）",
+      any("raw=" in t and "glass=" in t for _, t in _logged))
+
+# 背景是真的变黑了（用户切到全黑窗口）：不能永远冻着，一秒后认下来。
+# 这里直接把「第一次判黑的时刻」往前挪，不真等一秒。
+app.glass_black_since = _time.time() - snap.GLASS_BLACK_HOLD - 0.1
+app.mn_glass = bytes(total_bytes)
+app._present_main()
+# 注意阈值不是 0：黑玻璃底上屏还要压一层 0x80101217，出来是 (8,9,12)、
+# 平均 9.7 —— 这正是用户截图里量到的那个值，也是「黑一下」的指纹。
+check("真黑超过一秒后放行（不会永久冻住画面）", blank_luma() < base - 8,
+      "luma=%.1f（黑底上屏应为 ~9.7）" % blank_luma())
+check("放行后基准也变成黑，不再反复触发", app.glass_good_luma < 3,
+      "good=%.1f" % app.glass_good_luma)
+
+# 恢复：背景回到亮的，闸门不能挡 —— 只拦「由亮变黑」，不拦「由黑变亮」。
+app._refresh_glass(blank=False)
+app._present_main()
+check("背景变回正常后立刻跟上", blank_luma() > 5,
+      "luma=%.1f" % blank_luma())
+
+snap._write_log = _real_write_log
+
 user32.DestroyWindow(hwnd)
 app.probe.stop() if hasattr(app.probe, "stop") else None
 print()

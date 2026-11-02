@@ -68,7 +68,7 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "SnapLite"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 APP_TITLE = "%s %s" % (APP_NAME, APP_VERSION)
 
 DEBUG = bool(os.environ.get("SNAPLITE_DEBUG"))
@@ -79,6 +79,10 @@ CFG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "Sn
 CFG_FILE = os.path.join(CFG_DIR, "config.ini")
 LOG_FILE = os.path.join(CFG_DIR, "snap_error.log")
 DEBUG_LOG = os.path.join(CFG_DIR, "snap_debug.log")
+# 黑帧现场日志。和 DEBUG_LOG 分开、且**正式版也写**：它记的不是调试噪音，
+# 而是「本该看不见、却在屏幕上闪了一下」的异常事件，一次一行，平时一个
+# 字节都不写。没有它，这种偶发问题只能靠人眼复述「刚才黑了一下」。
+GLASS_LOG = os.path.join(CFG_DIR, "snap_glass.log")
 
 
 LOG_MAX_BYTES = 512 * 1024      # 单个日志文件的上限，超了只留最后一半
@@ -238,6 +242,20 @@ GLASS_TICK_IDLE = 250            # 空闲档：桌面没动静时的轻探（只
 GLASS_TICK_LIVE = 20             # 老系统退路用：31ms 一拍，约 32fps
 GLASS_LIVE_HOLD = 1.0            # 画面静止多久退回空闲档（秒），避免来回跳档
 GLASS_USE_LIVE_THREAD = True     # 活跃档交给后台线程（单元测试里关掉走同步路径）
+# ---------- 黑帧闸门（见 App._guard_glass）
+#
+# 抓屏是唯一一条「失败了也不作声」的链路：BitBlt 对没画上的区域不报错，
+# 而 grab_screen 每次都新建位图（新建出来就是全黑），所以一次没抓上就等于
+# 交回一整块纯黑。模糊链路同样不看 GDI+ 的返回码，黑进黑出，最后还强制
+# 把所有像素的 alpha 置成 255 —— 纯黑就这么不透明地贴上屏幕，成了「面板
+# 整块黑一下，250ms 后又自己变回来」。
+#
+# 判据用「绝对黑 + 上一帧不黑」两条同时成立：背景本来就是黑的（全屏黑窗口、
+# 黑壁纸）时上一帧也黑，不会误杀。三通道平均而不是只采 B 通道 —— 深红/深黄
+# 背景的 B 通道本来就接近 0，只看 B 会把它们当成黑帧。
+GLASS_BLACK_LUMA = 2.0   # 平均亮度低于这个值 = 这一帧是黑的
+GLASS_DARK_LUMA = 8.0    # 上一帧本身比这个还暗 = 背景真的黑，不拦
+GLASS_BLACK_HOLD = 1.0   # 连续判黑超过这么久就认了（背景确实变黑），放行
 # 拖动时的取背景方式。True = 后台线程一直抓「窗口周围一大块桌面」，主线程
 # 每帧只从里面裁；False = 老办法，主线程每帧现抓（单帧 5.7~27.9ms 不等）。
 # 关掉只给单元测试用：测试里没有真消息循环，多一条线程只会让断言更难写。
@@ -1217,6 +1235,28 @@ def _quick_luma(buf):
     return tot / float(cnt) if cnt else 0.0
 
 
+def _frame_luma(buf, ww, hh):
+    """整块 BGRA 的三通道平均亮度，按行、按列各取十几个点（约 0.05ms）。
+
+    和 `_quick_luma` 的区别：那个是沿缓冲区等距取点的**线性**采样，步长又是
+    4 的倍数，于是每次都落在同一个通道上 —— 实际量到的是单通道均值。拖动
+    路径只拿它比「掉没掉下去」，够用；这里要判「是不是纯黑」，深红背景的
+    B 通道本来就接近 0，只看一个通道会把正常画面误杀，所以必须三通道都算。"""
+    if not buf or ww <= 0 or hh <= 0:
+        return 0.0
+    stride = ww * 4
+    ys = max(1, hh // 14)
+    xs = max(1, ww // 14)
+    tot = cnt = 0
+    for y in range(ys // 2, hh, ys):
+        base = y * stride
+        for x in range(xs // 2, ww, xs):
+            o = base + x * 4
+            tot += buf[o] + buf[o + 1] + buf[o + 2]
+            cnt += 3
+    return tot / float(cnt) if cnt else 0.0
+
+
 def _crop_bgra(data, sw, x, y, w, h):
     """从一块 sw 宽的 BGRA 大图里裁出 (x, y) 起 w×h 的一块（按行拷贝）
 
@@ -1587,11 +1627,26 @@ class App:
         self.mn_keep_size = None
         self.main_rect = None
         self.mn_glass = None           # 模糊后的桌面底（BGRA 原始字节）
+        # 黑帧闸门的状态（见 _guard_glass）。glass_good 是**最近一次通过校验**
+        # 的那一帧，拦下坏帧时用它顶替 —— 存引用不存拷贝，零额外内存。
+        self.glass_good = None
+        self.glass_good_luma = -1.0    # 上面那一帧的平均亮度；-1 = 还没有基准
+        self.glass_black_since = 0.0   # 第一次判黑的时刻，用来「黑太久就认了」
+        self._raw_luma = -1.0          # 最近一次抓回来的**原始**画面亮度（诊断用）
+        self._luma_trace = []          # 最近几帧的亮度，坏帧时一起落盘
+        self._glass_log_at = 0.0       # 上一次写 snap_glass.log 的时刻（限频用）
         self.mn_cov = None             # 圆角覆盖率缓存
         self.mn_cov_key = None
         # 置顶（右上角图钉）。只活在这一次运行里，不写配置 —— 启动一律不置顶，
         # 免得用户忘了自己开过、还以为别的窗口关不掉。
         self.topmost = False
+        # 截图期间临时摘掉置顶，收工再戴回去。面板现在是「照常显示、抓屏时被
+        # 排除」，如果它还顶着 topmost，就会压在遮罩（也是 topmost）上面 ——
+        # 那块区域不跟着选区变亮/变灰，看着像面板卡在遮罩外面。
+        self.topmost_was = False
+        # 这次截图开头有没有把面板提交成透明帧（老系统退路才会）。
+        # 新版走「抓屏排除自己」，面板一帧都没动过，收工也不用重画。
+        self.main_blanked = False
         # 右键菜单弹着的时候为 True：TrackPopupMenu 是阻塞的，它自带的那个消息
         # 泵会继续派发 WM_TIMER，玻璃底照常抓屏 —— 菜单就盖在面板上，抓回来会
         # 把菜单自己拍进玻璃底。见 _panel_menu / _tick_glass。
@@ -2075,6 +2130,88 @@ class App:
         ctypes.memset(self.mn_bits, 0, W * H * 4)
         self._blit_main()
 
+    def _black_frame(self, glass, W, H):
+        """这一帧是不是「黑帧」：这一帧是黑的，而上一帧是亮的。
+
+        背景本来就黑（全屏黑窗口、黑壁纸）时上一帧也黑，返回 False ——
+        那种情况下面板本来就应该跟着变黑，不算异常。"""
+        if not glass:
+            return False
+        if _frame_luma(glass, W, H) >= GLASS_BLACK_LUMA:
+            return False
+        return bool(self.glass_good) and self.glass_good_luma >= GLASS_DARK_LUMA
+
+    def _guard_glass(self, glass, W, H):
+        """最后一道闸：这一帧玻璃底如果是「黑帧」，就别让它上屏。
+
+        为什么必须有这一道：抓屏是整条链路上唯一「失败了也不作声」的环节。
+        `grab_screen` 每次新建位图，而新建出来的位图本来就是全黑，所以 BitBlt
+        一次没画上东西，交回来的就是一整块纯黑，返回值还报成功；`_blur_bgra`
+        同样不看 GDI+ 的返回码，黑进黑出，末尾还把 alpha 强制置成 255 ——
+        纯黑就这么不透明地贴上屏幕。表现出来是：面板整块 (8,9,12) 的黑，
+        250ms 后下一拍抓到正常画面自己变回来。这条现象在截图里能量出来：
+        (8,9,12) 正好是压暗层 0x80101217 叠在纯黑上的结果（见 ARCHITECTURE 坑 28）。
+
+        判据要两条同时成立才拦：**这一帧是黑的** 且 **上一帧不黑**。
+        背景本来就是黑的（全屏黑窗口、黑壁纸）时上一帧也黑，不该误杀 ——
+        那种情况下面板本来就该是黑的。
+
+        拦的时候不能只是「不提交」：`mn_glass` 已经是黑的了，下一次因 hover
+        重绘还会拿到它。所以换成最近一次通过校验的那一帧（引用传递，零拷贝），
+        并把 `mn_glass` 一起回退，让状态自洽。
+
+        万一背景是真的变黑了（用户切到全黑窗口），连续判黑超过 GLASS_BLACK_HOLD
+        就放行 —— 宁可晚一秒跟上，也不能永远冻在上一个画面。"""
+        L = _frame_luma(glass, W, H)
+        self._luma_trace.append(round(L, 1))
+        if len(self._luma_trace) > 8:
+            del self._luma_trace[:len(self._luma_trace) - 8]
+
+        prev = self.glass_good_luma
+        black = L < GLASS_BLACK_LUMA
+        prev_ok = bool(self.glass_good) and prev >= GLASS_DARK_LUMA
+        if not (black and prev_ok):
+            # 正常帧；或者上一帧本身就黑（背景真黑），照常更新
+            self.glass_black_since = 0.0
+            self.glass_good = glass
+            self.glass_good_luma = L
+            return glass
+
+        now = time.time()
+        if not self.glass_black_since:
+            self.glass_black_since = now
+        held = now - self.glass_black_since
+        if held < GLASS_BLACK_HOLD:
+            self.mn_glass = self.glass_good
+            self._log_black_frame(L, prev, held, W, H)
+            return self.glass_good
+
+        # 黑了整整一秒：不是坏帧，是背景真的黑了，认下来
+        self.glass_black_since = 0.0
+        self.glass_good = glass
+        self.glass_good_luma = L
+        self._log_black_frame(L, prev, held, W, H, accepted=True)
+        return glass
+
+    def _log_black_frame(self, L, prev, held, W, H, accepted=False):
+        """把黑帧现场写进 snap_glass.log —— 一次一行，限频一秒一行。
+
+        关键是把「原始画面」和「模糊之后」两个亮度都记下来：raw 也接近 0
+        说明是抓屏环节就没抓到东西；raw 正常而 glass 是黑的，说明黑是在
+        模糊环节产生的。有这一行，下次再闪就能直接定到哪一环，不用猜。"""
+        now = time.time()
+        if now - self._glass_log_at < 1.0:
+            return
+        self._glass_log_at = now
+        try:
+            _write_log(GLASS_LOG, "%s  %s glass=%.1f prev=%.1f raw=%.1f 持续%.0fms 追踪=%s\n"
+                       % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                          "背景转黑(放行)" if accepted else "黑帧(已拦)",
+                          L, prev, self._raw_luma, held * 1000.0,
+                          self._luma_trace))
+        except Exception:
+            pass
+
     def _present_main(self, dst=None):
         """把主面板当前状态合成一帧提交到屏幕。
 
@@ -2086,6 +2223,9 @@ class App:
         total = W * H * 4
         glass = self.mn_glass
         have = bool(glass) and len(glass) == total
+        if have:
+            glass = self._guard_glass(glass, W, H)
+            have = bool(glass)
         if have:
             # 玻璃底整块不透明，直接覆盖；不必先清成透明（拖动时省一笔全缓冲写）
             ctypes.memmove(self.mn_bits, glass, total)
@@ -2170,7 +2310,9 @@ class App:
 
         def _grab(gx, gy, gw, gh, probe):
             # 窗口已经在上一步提交成全透明，不需要再设「抓屏排除自己」
-            return grab_screen(gx, gy, gw, gh).raw
+            raw = grab_screen(gx, gy, gw, gh).raw
+            self._raw_luma = _frame_luma(raw, gw, gh)
+            return raw
 
         try:
             # 四周多留一圈再模糊：抓的区域正好等于面板大小时，模糊会在四条边上
@@ -2475,6 +2617,7 @@ class App:
             return None
         if self._looks_like_me_at(raw, gw, gh, (ox, oy, W, H)):
             return None
+        self._raw_luma = _frame_luma(raw, gw, gh)
         return raw, ox, oy, gw, gh
 
     def _glass_frame_ready(self):
@@ -2715,6 +2858,7 @@ class App:
                 self._excl_release("tick")
             if raw and len(raw) == ww * hh * 4 \
                     and not self._looks_like_self_at(raw, ww, hh, probe):
+                self._raw_luma = _frame_luma(raw, ww, hh)
                 return raw
         dbg("抓背景两次都抓到自己，改用插值路径")
         return None
@@ -3261,11 +3405,15 @@ class App:
                 dbg("drag glass render failed: %r" % (e,))
                 return False
 
+        # 这一帧的背景如果是黑的（抓屏没抓到东西），**不搬窗口**。
+        # 搬过去配上黑底就是整块闪一下；按这里一贯的规矩，位置和内容
+        # 要么一起走、要么都不动（见坑 13 的「水波」）。
+        if self._black_frame(self.mn_glass, self.MW, self.MH):
+            return False
         self.drag_last_pos = pos
         self._drag_stat_note(self.mn_glass)
         self._present_main(w.POINT(left, top))
         return True
-
     def _grab_behind(self, left, top):
         """取 (left, top) 处面板大小的一层**玻璃底**（已模糊，可直接上屏）。
 
@@ -4239,39 +4387,61 @@ class App:
             self._release_capture_buffers()
         finally:
             self.capturing = False
+            self._excl_release("capture")
             if self.hwnd_main:
-                self._present_main()      # 开头提交过一帧全透明，这里必须画回来
+                # 只有走过透明帧那条路才需要画回来
+                if self.main_blanked:
+                    self._present_main()
+                if self.topmost_was:
+                    self.topmost_was = False
+                    user32.SetWindowPos(self.hwnd_main, w.HWND(HWND_TOPMOST),
+                                        0, 0, 0, 0,
+                                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                    self.topmost = self._is_topmost()
+            self.main_blanked = False
 
     def _begin_capture(self):
-        """截图的准备阶段：留底主界面 → 提交透明帧 → 抓屏建缓冲 → 显示遮罩。
+        """截图的准备阶段：留底主界面 → 抓屏建缓冲 → 显示遮罩。
 
-        关键点：主窗口保持“可见”状态但内容全透明，靠遮罩里的副本顶替显示。
-        这样它既不会被抓进截图，也不会被整屏遮罩盖住（以前置顶的写法会出现
-        “不管有没有框到都不变灰”和“点工具后主界面消失”）。"""
+        主窗口全程照常显示，靠「抓屏时把自己排除掉」保证截图里不含它，再从
+        留底像素把它补回遮罩。这样面板一帧都不动 —— 以前提交透明帧再抓，屏幕上
+        会有 183ms 什么都看不见，看着就是「点一下闪了一下」（见 ARCHITECTURE 坑 30）。
+        老系统没有这个属性，才退回透明帧那条老路。"""
         if self.recording:
             self._end_record()
         self.main_was_visible = bool(self.hwnd_main and user32.IsWindowVisible(self.hwnd_main))
         self.main_rect = None
         if self.hwnd_main:
-            # 不 SW_HIDE：窗口保持“可见”状态，只是这一瞬间提交一帧全透明，
-            # 这样抓屏拿不到我们自己的窗口（截图里不会出现 SnapLite），
-            # 但也不会出现「隐藏 → 弹出」那种闪烁和位置变化。
-            #
-            # 代价是屏幕上那块像素也没了，而遮罩要画“桌面上的主界面”，所以：
-            # 提交透明帧之前先把这一帧像素和窗口位置留底，抓完屏再补回抓屏图里。
-            # 之后主窗口一直保持全透明，由遮罩里的副本顶替显示 —— 这样它就跟
-            # 桌面上一个普通窗口一样：没框到时跟着变灰，框到时随选区变亮。
+            # 不 SW_HIDE、也不提交透明帧（新版）：窗口一直显示，只在抓屏那一下
+            # 让 DWM 当我们不存在。代价是屏幕上那块像素还在，遮罩要画“桌面上的
+            # 主界面”，所以抓屏前先把这一帧像素和窗口位置留底，抓完再补回抓屏图。
+            # 之后它就跟桌面上一个普通窗口一样：没框到时跟着变灰，框到时随选区变亮。
             if self.main_was_visible:
                 self._present_main()          # 确保留底的是屏幕上真正那一帧
                 rc = w.RECT()
                 user32.GetWindowRect(self.hwnd_main, byref(rc))
                 self.main_rect = (rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top)
                 self._keep_main_surface()
-            self._present_blank()
-            try:
-                dwmapi.DwmFlush()
-            except Exception:
-                time.sleep(0.05)
+                # 置顶时先摘下来：遮罩也是 topmost，留着它就会压在遮罩上面，
+                # 那一块不跟选区变亮/变灰。收工时在 _close_overlay 戴回去。
+                if self.topmost:
+                    self.topmost_was = True
+                    user32.SetWindowPos(self.hwnd_main, w.HWND(HWND_NOTOPMOST),
+                                        0, 0, 0, 0,
+                                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+                # 让 DWM 在抓屏时把面板当不存在：屏幕上照常显示，抓回来的是面板
+                # 背后的真实桌面。这样面板一帧都不用动，也就没有「消失一下再
+                # 出现」的那 183ms 闪烁（见 ARCHITECTURE 坑 30）。
+                if self._excl_acquire("capture"):
+                    self.main_blanked = False
+                else:
+                    # 老系统（Win10 2004 之前）没有这个属性，退回透明帧
+                    self.main_blanked = True
+                    self._present_blank()
+                    try:
+                        dwmapi.DwmFlush()
+                    except Exception:
+                        time.sleep(0.05)
 
         # 每次截图前重新读虚拟屏幕尺寸：运行中插拔显示器、改分辨率或改缩放后，
         # 用启动时的旧尺寸会让遮罩盖不满（露白边），抓屏和裁剪也跟着错位。
@@ -4338,12 +4508,18 @@ class App:
     def _build_capture_buffers(self):
         """抓一张整屏，造出三套缓冲：shot 原图 / dim 压暗 / back 呈现。
 
+        **只从屏幕取一次像素**：dc_shot 就是这次 BitBlt 的落点，马赛克取色用的
+        `shot_raw` 再从 dc_shot 回读。回读发生在「主面板补回去之后」，所以取色
+        源和屏幕上看到的那张图是同一份数据。
+
+        以前是抓两张：`grab_screen` 抓一张给取色用，再 BitBlt 一次给呈现用。
+        两张的差别正好是「有没有面板」，于是马赛克落在面板上时会取到面板背后
+        的壁纸 —— 看着像画布被打穿了一个洞（见 ARCHITECTURE 坑 29）。合成一张
+        之后这个洞不存在了，顺带省掉一次全屏 BitBlt（本机实测 37ms）。
+
         压暗层在这里一次算好，之后每帧只做一次 BitBlt，不用反复叠半透明黑。"""
         self._release_capture_buffers()
         vsx, vsy, vsw, vsh = self.vs
-        self.shot_buf = grab_screen(vsx, vsy, vsw, vsh)
-        self.shot_raw = self.shot_buf.raw        # 马赛克取色用（只读一次，避免每块都复制）
-        self._mos_cache = {}
 
         sdc = user32.GetDC(None)
         self.hdc_screen = sdc
@@ -4355,8 +4531,12 @@ class App:
             setattr(self, "bmp_" + name, bmp)
             setattr(self, "dc_" + name + "_old", old)
         gdi32.BitBlt(self.dc_shot, 0, 0, vsw, vsh, sdc, vsx, vsy, SRCCOPY)
-        # 抓屏时主窗口是全透明的，先把它的像素补回原位再生成压暗层
+        # 抓的这一刻面板要么被「抓屏排除自己」、要么是全透明帧，所以这块本来是
+        # 桌面本身；把面板像素补回来，遮罩上它才像桌面上一个普通窗口
         self._blend_main_into_shot()
+        self.shot_buf = None
+        self.shot_raw = self._shot_pixels(vsw, vsh)
+        self._mos_cache = {}
 
         # 呈现用的缓冲必须是 DIB（分层窗口只能吃 DIB 段）
         bi = BITMAPINFO()
@@ -4376,6 +4556,30 @@ class App:
         gdi32.BitBlt(self.dc_dim, 0, 0, vsw, vsh, self.dc_shot, 0, 0, SRCCOPY)
         with GFX(self.dc_dim) as g:
             g.fill(0x9A000000, 0, 0, vsw, vsh)
+
+    def _shot_pixels(self, vsw, vsh):
+        """把 dc_shot 的像素回读成 BGRA 字节，给马赛克取色用。
+
+        回读而不是另抓一次屏：另抓的那一张不含补回去的主面板，马赛克落在面板上
+        就会「透过面板」取到背后的壁纸。一次全屏回读实测 4.6ms，只在开始截图
+        时做一次，画马赛克时是纯内存读，不增加任何每帧开销。"""
+        if not (self.dc_shot and self.bmp_shot):
+            return None
+        bi = BITMAPINFO()
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER)
+        bi.bmiHeader.biWidth = vsw
+        bi.bmiHeader.biHeight = -vsh
+        bi.bmiHeader.biPlanes = 1
+        bi.bmiHeader.biBitCount = 32
+        bi.bmiHeader.biCompression = 0
+        buf = ctypes.create_string_buffer(vsw * vsh * 4)
+        ok = gdi32.GetDIBits(self.dc_shot, self.bmp_shot, 0, vsh, buf,
+                             byref(bi), DIB_RGB_COLORS)
+        if not ok:
+            # 回读失败就不给取色，马赛克画不出来，但不会画错
+            dbg("shot pixels readback failed")
+            return None
+        return buf
 
     def _release_capture_buffers(self):
         """释放截图期间的缓冲和屏幕 DC。
@@ -5391,13 +5595,24 @@ class App:
         self.drag_snap = None
         self.capturing = False
         self.main_rect = None
+        # 「抓屏排除自己」是借来的，收工必须还 —— 否则从此以后微信/QQ 截图
+        # 都拍不到这个面板
+        self._excl_release("capture")
         if self.main_was_visible and self.hwnd_main:
             user32.ShowWindow(self.hwnd_main, SW_SHOW)
-            # 截图期间主窗口停在“全透明”那一帧，这里必须显式画回来。
-            # 一帧就提交整窗内容，不需要再 InvalidateRect 触发第二次重绘。
-            self._present_main()
+            if self.main_blanked:
+                # 老系统退路下截图期间停在“全透明”那一帧，这里必须显式画回来。
+                # 一帧就提交整窗内容，不需要再 InvalidateRect 触发第二次重绘。
+                self._present_main()
             user32.SetForegroundWindow(self.hwnd_main)
+        if self.topmost_was and self.hwnd_main:
+            # 截图开头摘掉的置顶，现在戴回去（用户没机会在遮罩底下改它）
+            self.topmost_was = False
+            user32.SetWindowPos(self.hwnd_main, w.HWND(HWND_TOPMOST), 0, 0, 0, 0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+            self.topmost = self._is_topmost()
         self.main_was_visible = False
+        self.main_blanked = False
 
     def _cancel_capture(self):
         """取消截图：收起工具条、关遮罩、恢复主界面"""
