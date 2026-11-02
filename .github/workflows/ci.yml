@@ -66,6 +66,24 @@ jobs:
       - name: 主面板交互（hover/点 ✕/拖窗口/按键）
         run: python tests/test_main_panel.py
 
+      - name: 玻璃底跟随桌面内容变化（背景在有视频/动画时必须跟上）
+        run: python tests/test_glass_follow.py
+
+      - name: 活跃档后台线程（起停 / 静止收工 / 截图拖动让路 / 帧不堆积）
+        run: python tests/test_glass_live_thread.py
+
+      - name: 抓屏属性的归属（别人清不掉 / 抓到自己不上屏 / 拖动不吃脏帧）
+        run: python tests/test_glass_guard.py
+
+      - name: 模糊边缘（纯灰图模糊后四边必须与中心同亮度）
+        run: python tests/test_blur_edge.py
+
+      - name: 主面板右键菜单（只在 logo 上弹 / 菜单开着时不抓屏）
+        run: python tests/test_panel_menu.py
+
+      - name: 健壮性（托盘重建 / 单实例 / 改分辨率 / 日志上限）
+        run: python tests/test_robust.py
+
       - name: 生成界面截图（校验渲染管线可用）
         run: |
           python tools/make_screenshot.py

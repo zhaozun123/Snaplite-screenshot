@@ -12,23 +12,38 @@
 
 ## 下载
 
-最新版本 **v1.3.0**（Windows 单文件绿色版，约 4.5 MB，64 位，双击即用，无需安装 Python）：
+最新版本 **v1.4.0**（Windows 单文件绿色版，约 4.6 MB，64 位，双击即用，无需安装 Python）：
 
-**[⬇ 下载 SnapLite.exe](https://github.com/zhaozun123/Snaplite-screenshot/releases/download/v1.3.0/SnapLite.exe)**
+**[⬇ 下载 SnapLite.exe](https://github.com/zhaozun123/Snaplite-screenshot/releases/download/v1.4.0/SnapLite.exe)**
 
-> 首次运行会在 `%APPDATA%\SnapLite\` 生成配置文件。托盘图标右键可退出（关窗口只是隐藏到托盘）。
+> 首次运行会在 `%APPDATA%\SnapLite\` 生成配置文件。
+> 退出方式：托盘图标右键 → 退出，或**在面板左上角「SnapLite」字样上右键** → 退出
+> （关窗口只是隐藏到托盘）。
 
-**v1.3.0 更新**：
+**v1.4.0 更新**：
 
-- **新增矩形 / 椭圆标注工具**：拖拽画出方框或圆圈，可拖 8 个手柄改大小、整体拖动、方向键微调
-- **工具条重做排版**：图标与文字改为按真实墨迹整体居中，10 颗按钮左右留白差 ≤ 1px
-- **工具条整体收窄**：外框缩至 0.86、字号只缩到 0.92，文字不显小但更紧凑
-- **截图时把自身排除在外**：玻璃背景改为抓「没有自己」的真实桌面，不再靠插值猜，观感明显更实
-- 内部重构：初始化与消息分派拆分、GDI+ 资源全部改为上下文管理、渲染缓存独立，为后续加文字标注打底
+- **新增「总在最前」按钮**：面板右上角图钉，置顶时图标常亮（状态不写入配置，重启后复位）
+- **主界面可右键出菜单**：在左上角「SnapLite」字样上右键即可，菜单与托盘同一份
+- **边缘锯齿修好了**：圆角的透明度遮罩原来是 3×3 超采样、只有 9 档取值，弧线上
+  一跳一跳；改成按圆弧面积精确积分，档位 9 → 17~22 档，与真值偏差从 16/255 降到 2/255
+- **圆角收小**：20px → 15px，弧线更短、1px 高光在弧上的相位抖动也更少
+- **静止时边缘内侧那圈阴影没了**：模糊函数原先把图外当黑色，最外一行只有一半亮度；
+  改为四周多抓 13px 再模糊、从内部裁出面板，四边从「暗 12~14」变成「近乎持平」
+- **标题区整理**：去掉「轻量截图」胶囊，版本号改为跟在标题后面
 
-> **修复（同版本重打包）**：初版 v1.3.0 点「方框」「圆形」按钮没反应——按钮的点击派发
-> 漏了这两种工具，会掉进兜底分支直接取消截图。现已修复，并补 `tests/test_tool_click.py`
-> 逐按钮发真实窗口消息做回归，杜绝同类问题（新增工具时漏改派发分支）。
+**修复**：
+
+- **托盘图标在 explorer 重启后消失**：收到系统的 `TaskbarCreated` 广播就重新挂上
+- **重复双击启动出两个实例、互相抓屏**：加单实例互斥，第二个实例直接把已有窗口叫到前面后退出
+- **改分辨率 / 插拔显示器后面板可能卡在屏幕外**：监听 `WM_DISPLAYCHANGE`，把窗口夹回可视区
+- **错误日志无限增长**：上限 512 KB，超限只保留后半段
+- 拖动时「抓到自己」的误判：自检在拖动路径上失效，会吃进脏帧导致背景抖动
+
+**v1.3.0**：
+
+- 新增矩形 / 椭圆标注工具（拖 8 个手柄改大小、整体拖动、方向键微调）
+- 工具条按真实墨迹整体居中，10 颗按钮左右留白差 ≤ 1px
+- 截图时把自身排除在外：玻璃背景改用「没有自己」的真实桌面，不再靠插值猜
 
 **v1.2.0**：界面改为苹果液态玻璃风；拖动主面板时背景模糊逐像素实时刷新；
 修复截图时主界面不随遮罩一起压暗、点工具后主界面消失、工具条切换工具时选项排残留错乱等问题。
@@ -47,7 +62,9 @@
 | **五种标注工具** | 画笔（自由手写）、马赛克（涂抹遮挡）、箭头（指向说明）、方框、圆形（圈重点） |
 | **撤销 / 重做** | 多级撤销；箭头可拖两端改方向，方框/圆形可拖 8 手柄改大小，均可方向键微调 |
 | **秒切输出** | 复制到剪贴板（CF_DIB）或另存为 PNG |
-| **常驻托盘** | 关窗不退出，托盘菜单里可开/关开机自启 |
+| **可置顶** | 面板右上角图钉一键「总在最前」，再点一下取消 |
+| **两处右键菜单** | 托盘图标、或面板左上角「SnapLite」字样，同一份菜单：改热键 / 开机自启 / 退出 |
+| **常驻托盘** | 关窗不退出，菜单里可开/关开机自启；explorer 重启后图标自动挂回 |
 | **单文件绿色版** | 打包成一个 exe，扔哪都能跑，配置文件写在 `%APPDATA%\SnapLite\` |
 
 ## 界面
@@ -131,7 +148,7 @@ python -m PyInstaller SnapLite.spec --noconfirm --clean
 
 ```
 snap.py              主程序（全部功能都在这一个文件里）
-ARCHITECTURE.md      代码结构说明：八段职责、改什么去哪里、十一个必知坑、自测清单
+ARCHITECTURE.md      代码结构说明：八段职责、改什么去哪里、二十六个必知坑、自测清单
 SnapLite.spec        PyInstaller 打包配置
 make_ico.py          生成 app.ico（纯 BMP/AND 掩码，兼容各版本资源管理器）
 app.ico              程序图标
@@ -143,7 +160,13 @@ tests/
   test_tool_click.py    工具条逐按钮点击派发（发真实窗口消息，防"点了没反应"）
   test_anno_render.py   标注渲染像素验证 + 80 次重绘 GDI 句柄不泄漏
   test_tb_center.py     工具条逐按钮校验：左右留白、图标文字同高、文字不折行
-  test_main_panel.py    主面板消息：hover / 点击 ✕ — / 拖动 / 丢失捕获 / 录制热键
+  test_main_panel.py    主面板消息：hover / 点击 ✕ — 图钉 / 拖动 / 丢失捕获 / 录制热键 / 置顶
+  test_panel_menu.py    主面板右键菜单：只在 logo 上弹、菜单项读回核对、菜单开着时不抓屏
+  test_glass_follow.py  玻璃底跟随：背景在变时必须换，没变时一帧都不多算
+  test_glass_live_thread.py  活跃档后台线程：起停 / 静止收工 / 让路 / 帧不堆积
+  test_glass_guard.py       抓屏属性的归属 / 抓到自己不上屏 / 拖动不吃脏帧
+  test_blur_edge.py         模糊不许吃「图外」：纯灰图模糊后四边必须与中心同亮度
+  test_robust.py            托盘重建 / 单实例 / 改分辨率 / 日志上限
   test_overlay_msgs.py  遮罩消息：框选 / 移动 / 改大小 / 标注 / 方向键 / 右键与 Esc 逐级退出
 tools/
   check_undefined.py    静态检查：抓出未定义名（NameError 风险）
@@ -154,6 +177,9 @@ tools/
   verify_*.py           逐项回归（工具条缝隙、切模式残留、拖动玻璃、截图内主界面、
                         连续截图句柄、玻璃跟随桌面变化），改到对应模块就必须跑
   preview_*.py          把渲染结果拼成对比图，肉眼看版式
+  audit_*.py            一次性取证：量边缘亮度 / 遮罩档位 / 右键菜单位置 / 能否注册热键
+  png_read.py           极简 PNG 解码（zlib + 5 种滤波），环境没有 Pillow 也能读图
+  png_write.py          极简 PNG 编码，不依赖 GDI+（64 位下存图偶尔会失败）
   make_screenshot.py    离屏渲染 README 界面截图
   excluded_modules.txt  打包时排除的标准库模块清单（对应 spec 里的 excludes）
 .github/
@@ -171,6 +197,15 @@ python tests/test_pen.py              # 画笔自测
 python tests/test_pen_visual.py       # 画笔像素级验证
 python tests/test_shapes.py           # 方框 / 圆形自测
 python tests/test_overlay_msgs.py     # 遮罩消息交互自测
+python tests/test_main_panel.py       # 主面板：hover / 按钮 / 拖动 / 置顶
+python tests/test_panel_menu.py       # 主面板右键菜单（只认 logo）
+python tests/test_glass_follow.py     # 玻璃底跟随背景变化
+python tests/test_glass_live_thread.py  # 活跃档线程：起停 / 让路 / 收工
+python tests/test_glass_guard.py        # 抓屏属性归属 / 脏帧不上屏
+python tests/test_blur_edge.py          # 模糊不许把「图外」当黑
+python tests/test_robust.py             # 托盘重建 / 单实例 / 改分辨率 / 日志上限
+python tools/verify_glass_motion.py   # 真机验证：背景在动时玻璃底跟不跟
+python tools/verify_glass_pace.py     # 真机验证：活跃档出帧节奏（约 95 帧/秒）
 python tools/verify_tool_opts.py      # 工具条切模式不残留
 python tools/verify_drag_glass.py     # 拖动玻璃与真实桌面一致
 python tools/make_screenshot.py       # 重新生成 assets/ 里的截图

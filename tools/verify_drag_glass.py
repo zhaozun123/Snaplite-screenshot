@@ -70,11 +70,15 @@ def main():
     bx, by = ax + 320, ay + 120
     print("窗口尺寸 %dx%d，位置 A=(%d,%d)  B=(%d,%d)" % (W, H, ax, ay, bx, by))
 
-    # --- 位置 A
-    app._begin_drag_glass()
-    if not app.drag_active:
-        print("FAIL: 拖动缓存没建起来（drag_active=False）")
+    # --- 走真实入口开始拖动（新系统会设「抓屏排除自己」并走实时抓屏）
+    app._start_main_drag()
+    if not app.main_drag:
+        print("FAIL: 拖动没能开始（main_drag=False）")
         return 1
+    print("取背景路径：%s" % ("实时抓目标位置" if app.drag_live else "整屏缩略图（老系统退路）"))
+    aff = w.DWORD()
+    user32.GetWindowDisplayAffinity(app.hwnd_main, byref(aff))
+    print("拖动中 抓屏属性 = 0x%X（0x11 = 排除自己）" % aff.value)
     app.drag_last_pos = None
     app._drag_frame(ax, ay)
     glass_a = app.mn_glass
@@ -136,7 +140,13 @@ def main():
     except Exception as e:
         print("\n(句柄检查跳过: %r)" % (e,))
 
-    app._end_drag_glass()
+    app._end_main_drag()
+    user32.GetWindowDisplayAffinity(app.hwnd_main, byref(aff))
+    print("拖动结束后 抓屏属性 = 0x%X（必须回到 0，否则别的截图工具拍不到主面板）"
+          % aff.value)
+    if aff.value != 0:
+        print("FAIL: 「抓屏排除自己」没恢复")
+        ok = False
     user32.DestroyWindow(app.hwnd_main)
     print("\n结果：%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

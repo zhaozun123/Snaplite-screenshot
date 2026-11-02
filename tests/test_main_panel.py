@@ -64,10 +64,11 @@ app.create_main()
 hwnd = app.hwnd_main
 check("主窗口创建", bool(hwnd))
 
-close, hide, btn, hot = app._main_layout()
+close, pin, hide, btn, hot = app._main_layout()
 
 # ---------- 1. hover 命中
-for name, rect, want in (("✕", close, "close"), ("—", hide, "hide"),
+for name, rect, want in (("✕", close, "close"), ("图钉", pin, "pin"),
+                         ("—", hide, "hide"),
                          ("截图按钮", btn, "btn"), ("热键条", hot, "hot")):
     x, y = center(rect)
     send(hwnd, WM_MOUSEMOVE, 0, pack(x, y))
@@ -88,9 +89,22 @@ check("鼠标离开后高亮清空", app.hover_main is None and not app.tracking
 x, y = app.px(6), app.MH - app.px(6)
 send(hwnd, WM_LBUTTONDOWN, 1, pack(x, y))
 check("空白处按下开始拖窗口", app.main_drag)
+
+# 拖动期间必须让系统抓屏时把自己摘掉，否则「抓目标位置」会抓到自己的拖影 ——
+# 那正是旧版拖动时「画面像叠了一层」的来源
+_aff = snap.w.DWORD()
+user32.GetWindowDisplayAffinity(hwnd, byref(_aff))
+if app.drag_live:
+    check("新系统拖动时设为抓屏排除自己", _aff.value == 0x11, "0x%X" % _aff.value)
+else:
+    print("[SKIP] 本机不支持「抓屏排除自己」，走的是缩略图退路")
+
 # 抬起来要收尾
 send(hwnd, WM_LBUTTONUP, 0, pack(x, y))
 check("抬手结束拖窗口", not app.main_drag)
+user32.GetWindowDisplayAffinity(hwnd, byref(_aff))
+check("抬手后抓屏属性已恢复", _aff.value == 0, "0x%X" % _aff.value)
+check("抬手后不再走实时抓屏路径", not app.drag_live)
 
 # ---------- 4. 拖动中被系统抢走捕获 → 也要收尾
 send(hwnd, WM_LBUTTONDOWN, 1, pack(x, y))
@@ -138,9 +152,61 @@ check("WM_MOVE 返回 0 且不触发重画", r == 0, "返回 %s" % r)
 # ---------- 10. 拆出来的命中函数和分派一致
 check("_main_hit 与各区域一致",
       app._main_hit(*center(close)) == "close"
+      and app._main_hit(*center(pin)) == "pin"
       and app._main_hit(*center(hide)) == "hide"
       and app._main_hit(*center(btn)) == "btn"
       and app._main_hit(*center(hot)) == "hot")
+
+# ---------- 11. 图钉：置顶开关
+# 不能只看 self.topmost 这个书签，要真去问窗口的 ex-style —— SetWindowPos 失败
+# 时（比如参数传错）状态位照样翻转，界面上的图钉会亮，实际却没置顶。
+_gwl = ctypes.windll.user32.GetWindowLongW
+_gwl.restype = ctypes.c_long
+_gwl.argtypes = [ctypes.c_void_p, ctypes.c_int]
+GWL_EXSTYLE = -20
+
+
+def ex_topmost():
+    return bool(_gwl(hwnd, GWL_EXSTYLE) & snap.WS_EX_TOPMOST)
+
+
+check("初始不置顶", (not app.topmost) and (not ex_topmost()))
+send(hwnd, WM_LBUTTONDOWN, 1, pack(*center(pin)))
+check("点图钉后置顶真的生效", app.topmost and ex_topmost(),
+      "topmost=%r ex=%r" % (app.topmost, ex_topmost()))
+check("置顶不改变窗口可见性", bool(user32.IsWindowVisible(hwnd)))
+check("置顶不触发拖窗口", not app.main_drag)
+send(hwnd, WM_LBUTTONDOWN, 1, pack(*center(pin)))
+check("再点一次取消置顶", (not app.topmost) and (not ex_topmost()),
+      "topmost=%r ex=%r" % (app.topmost, ex_topmost()))
+
+# 置顶是「面板自己」的属性，不能顺手把别的窗口也顶上去：
+# 按钮矩形必须跟 — ✕ 一样都在标题行里，且互不重叠（重叠会点一个触发两个）
+check("图钉与 — ✕ 不重叠",
+      pin[0] + pin[2] <= hide[0] and hide[0] + hide[2] <= close[0],
+      "pin=%s hide=%s close=%s" % (pin, hide, close))
+check("三个标题行按钮都在面板内",
+      all(r[0] >= 0 and r[0] + r[2] <= app.MW for r in (pin, hide, close)))
+
+# ---------- 12. SetWindowPos 失败时不能假装成功
+# 这条锁的是 `_toggle_topmost` 的「回读真实状态」：以前是先翻书签再调 API，
+# API 失败时书签照样翻，图钉亮着但窗口没置顶，用户点第二下才「正好」生效。
+print("\n=== 12. 置顶失败不能假装成功 ===")
+_real_swp = snap.user32.SetWindowPos
+snap.user32.SetWindowPos = lambda *a: 0          # 桩：什么都不做，模拟失败
+try:
+    send(hwnd, WM_LBUTTONDOWN, 1, pack(*center(pin)))
+    check("SetWindowPos 没生效时 topmost 不翻转", not app.topmost,
+          "topmost=%r" % (app.topmost,))
+    check("SetWindowPos 没生效时窗口确实没置顶", not ex_topmost())
+finally:
+    snap.user32.SetWindowPos = _real_swp
+send(hwnd, WM_LBUTTONDOWN, 1, pack(*center(pin)))
+check("恢复后置顶仍然可用", app.topmost and ex_topmost(),
+      "topmost=%r ex=%r" % (app.topmost, ex_topmost()))
+send(hwnd, WM_LBUTTONDOWN, 1, pack(*center(pin)))
+check("收回到不置顶，不留状态给后面的检查",
+      (not app.topmost) and (not ex_topmost()))
 
 user32.DestroyWindow(hwnd)
 app.probe.stop() if hasattr(app.probe, "stop") else None

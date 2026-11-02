@@ -23,12 +23,26 @@ import threading
 import time
 import traceback
 import winreg
-from math import hypot, radians, cos, sin, floor, ceil
+from math import hypot, radians, cos, sin, floor, ceil, sqrt
 from ctypes import (windll, byref, sizeof, POINTER, WINFUNCTYPE, Structure,
                     c_int, c_uint, c_long, c_ulong, c_ushort, c_ulonglong,
                     c_void_p, c_float, c_ubyte, c_short, c_wchar)
 
 import ctypes.wintypes as w
+
+# GIL 切换周期从默认 5ms 压到 1ms。
+#
+# 拖动时后台预取线程每轮都要做几步纯 Python 的活（拼缓冲、逐行裁切、判「是不是
+# 抓到自己」）。默认 5ms 意味着它一旦拿到 GIL 就能攥满 5ms，主线程这期间既画不
+# 了下一帧、也没法更新取景目标，而窗口还在往前跑 —— 覆盖跟不上，于是频繁触发
+# 主线程补抓（一次十几毫秒），那一下就是「快速拖动时的抖动」。
+#
+# 实测（面板 340×148、每帧 40 像素、50 帧）：补抓 15 次 → 1 次，提交间隔的
+# 变异系数 33.8% → 13.2%。代价是线程切换略频繁，可忽略。
+try:
+    sys.setswitchinterval(0.001)
+except Exception:
+    pass
 
 # ============================================================ 基础
 user32 = windll.user32
@@ -54,7 +68,7 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "SnapLite"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 APP_TITLE = "%s %s" % (APP_NAME, APP_VERSION)
 
 DEBUG = bool(os.environ.get("SNAPLITE_DEBUG"))
@@ -67,10 +81,24 @@ LOG_FILE = os.path.join(CFG_DIR, "snap_error.log")
 DEBUG_LOG = os.path.join(CFG_DIR, "snap_debug.log")
 
 
+LOG_MAX_BYTES = 512 * 1024      # 单个日志文件的上限，超了只留最后一半
+
+
 def _write_log(path, text):
-    """写日志失败也不能影响主流程（磁盘满、权限不足都可能）"""
+    """写日志失败也不能影响主流程（磁盘满、权限不足都可能）。
+
+    必须限长：`_safe_proc` 把每个窗口过程都包了起来，万一某个异常在**每帧**
+    都触发一次（8ms 一帧），日志会以每秒兆字节的速度往盘上写，几分钟就把
+    系统盘塞满。超过上限时只保留最后一半，既保住现场又不失控。"""
     try:
         os.makedirs(CFG_DIR, exist_ok=True)
+        if os.path.exists(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+            keep = LOG_MAX_BYTES // 2
+            with open(path, "rb") as f:
+                f.seek(-keep, os.SEEK_END)
+                tail = f.read()
+            with open(path, "wb") as f:
+                f.write(b"[... older entries dropped ...]\n" + tail)
         with open(path, "a", encoding="utf-8") as f:
             f.write(text)
     except Exception:
@@ -156,6 +184,8 @@ WM_RBUTTONUP = 0x0205
 WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
 WM_ACTIVATE = 0x0006
+# 分辨率 / 显示器插拔 / 改缩放：窗口可能被留在屏幕外，玻璃底的坐标也全变了
+WM_DISPLAYCHANGE = 0x007E
 WM_SETCURSOR = 0x0020
 WM_MOUSELEAVE = 0x02A3
 WM_HOTKEY = 0x0312
@@ -163,10 +193,90 @@ WM_TIMER = 0x0113
 WM_CAPTURECHANGED = 0x0215
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
+WM_GLASS_FRAME = WM_APP + 2       # 后台线程算好一帧，叫主线程贴上去
 
-# 玻璃底自动跟随：监听「别的窗口动了 / 显示了 / 切换了」
+# 玻璃底自动跟随桌面。两档节拍，理由见下面的实测数字。
+#
+# 为什么必须自己「拍」：视频播放、网页动画、滚动这些「画面自己在变」的情况
+# 不产生任何窗口事件（只有搬家 / 切前台才产生），光靠事件钩子的话玻璃底会
+# 一直停在很久以前那一帧。所以只能按节拍主动抓来比对。
+#
+# 为什么分两档：桌面静止时反复做完整刷新是纯浪费，空闲档只做「抓 + 比对」
+# （发现像素没变就既不模糊也不重画），确认真的变了才切高频档。
+#
+# 【重要】耗时里「等」和「算」必须分开看。用 time.process_time 量出来：
+#     抓屏      墙钟 6.16ms   真 CPU 0.00ms   ← 全在等 DWM 给快照
+#     提交一帧  墙钟 3.07ms   真 CPU 1.04ms
+#     整条刷新  墙钟 12.3ms   真 CPU 0.26ms   ← 98% 是等待
+# 所以「12.5ms 一帧」不等于「烧掉 12.5ms 的 CPU」。按墙钟算占用会高估 40 倍，
+# 早前注释里写的 2.4% / 10% 就是这么算错的，已作废。
+# 真实占用 = 0.26ms × 帧率：12fps→0.3%、30fps→0.8%、60fps→1.6%（单核）。
+# 唯一的代价是「主线程被阻塞」：12.3ms 里主线程动不了，所以帧间隔不能贴到
+# 12.3ms 以下，否则消息响应会被挤满。
+#
+# 【定时器精度】SetTimer 会被量化到系统时间片 15.6ms 的整数倍，实测：
+#     设  8ms → 实际 15.6ms（64 次/秒）
+#     设 20ms → 实际 31.3ms（32 次/秒）
+#     设 33ms → 实际 47.6ms（21 次/秒）  ← 想设 33 会掉到 21 帧，不能这么写
+#
+# 【为什么不靠定时器做活跃档】定时器的毫秒数跟屏幕刷新率**除不尽**，就会产生
+# 「拍频」：帧有时跨 5 次刷新、有时跨 6 次，多出来的那一次每几帧出现一次，
+# 在人眼里就是一阵一阵的顿挫。实测（166Hz 屏，消隐 6.01ms）：
+#     定时器 31ms 一帧 = 5.13 个刷新周期 → 顿挫频率 4.2Hz  ← 人眼最敏感的一段
+#     拖动   9.2ms 一帧 = 1.54 个刷新周期 → 顿挫频率 58Hz   ← 快到看不见
+# 这解释了「拖动没问题、静止还抖」。关键不是「对齐消隐」，是**帧率要够高**：
+# 帧间隔的小数部分会被摊到每一两帧上，帧率越高摊得越密，顿挫频率就越往
+# 人眼分辨不出的地方跑。所以活跃档改由后台线程驱动，一轮做完立刻下一轮。
+#
+# 试过「每轮先 DwmFlush 等消隐」，实测反而更差，已放弃（数字见 _glass_live_loop）：
+#     等消隐 58.7 帧 / 顿挫 17.0Hz      不等 85.0 帧 / 顿挫 51.9Hz
+#
+# 定时器保留下来做两件事：桌面静止时的低频探测（250ms）、以及老系统（没有
+# 「抓屏排除自己」）的退路。活跃档由线程接手后，主线程这一拍直接返回。
 TIMER_GLASS = 0x51
-GLASS_TICK_MS = 90               # 桌面变了以后最多等这么久重算一次（约 11fps）
+GLASS_TICK_IDLE = 250            # 空闲档：桌面没动静时的轻探（只抓不画）
+GLASS_TICK_LIVE = 20             # 老系统退路用：31ms 一拍，约 32fps
+GLASS_LIVE_HOLD = 1.0            # 画面静止多久退回空闲档（秒），避免来回跳档
+GLASS_USE_LIVE_THREAD = True     # 活跃档交给后台线程（单元测试里关掉走同步路径）
+# 拖动时的取背景方式。True = 后台线程一直抓「窗口周围一大块桌面」，主线程
+# 每帧只从里面裁；False = 老办法，主线程每帧现抓（单帧 5.7~27.9ms 不等）。
+# 关掉只给单元测试用：测试里没有真消息循环，多一条线程只会让断言更难写。
+DRAG_PREFETCH = True
+# 预取快照的**余量**。整块要模糊一次（546×364 约 6ms，放在后台线程里），
+# 片越大每轮越慢、快照反而跟不上手，所以「加大余量」是错的方向：面积从 198k
+# 涨到 325k，整块模糊从 5.8ms 涨到 11ms，抢走主线程时间，单帧中位 3.8→9.7ms
+# —— 补抓没了，整体反而更钝（见 ARCHITECTURE 坑 20）。
+#
+# 正确的做法是**面积不变、只改形状**：面板是 340×148 的横条，正方形余量在运动
+# 方向上只有 96px，垂直那 96px 基本浪费。按运动方向把余量拉长、另一方向收窄，
+# 面积一样（每轮耗时不变），覆盖能力按方向翻几倍。实测同一趟 5000px/s：
+#     96×96（现状）     补抓 9/110   单帧最大 29.7ms
+#     192×48（同面积）  补抓 0/110   单帧最大  5.2ms
+# DRAG_PAD 现在只是「对称兜底」：首帧补抓、以及没有方向信息时用它。
+DRAG_PAD = 96
+# 余量形状的面积目标（像素²）。现状 546×364 = 198744，保持这个面积，模糊耗时
+# 就还是那 6ms，主线程一帧都不会变慢。
+DRAG_AREA = 546 * 364
+# 前向余量最多占总余量的比例。0.8 = 前 80% / 后 20%（单方向全速时）。
+DRAG_LEAN_MAX = 0.80
+# 单帧位移达到这么多像素就算「全速」，前向倾斜到 DRAG_LEAN_MAX。
+# 12ms 一轮的 60px ≈ 5000px/s，正好是最容易抖的那档。
+DRAG_LEAN_FULL = 60.0
+# 主线程补抓时只抓这么点余量：一帧最多移动几十像素，够用就行。
+# 补抓是拖动里唯一会让主线程等 DWM 的地方，抓得越小卡得越轻（39 ≈ 6ms，
+# 而按 DRAG_PAD 抓要大一半）。它靠「尺寸取 BLUR_F 的整数倍」保证与小片
+# 相位一致 —— 见 _drag_world_rect 的说明。
+DRAG_PAD_SMALL = 39
+# 抓和模糊拆成两条线程并行（流水线）。**默认关闭**：后台刷新周期确实从 12ms
+# 降到 6.4ms、补抓从 14/50 降到 1/50，但两个 Python 线程争 GIL，主线程每帧从
+# 3.6ms 涨到 10.9ms，帧间隔 12ms → 19ms，整体反而更不匀（CV 6.6% → 21.4%）。
+# 留在这里是因为换个语言/去掉 Python 层拷贝就能吃到这个收益，别当它没验过。
+DRAG_PIPELINE = False
+# 预取线程的优先级。抓屏的 BitBlt 会放掉 GIL，这一刻两个线程在争 CPU 与 DWM
+# 表面的交出顺序；把后台降到 BELOW_NORMAL，主线程要画帧时就能先拿到手。
+# 实测不改变中位（3.7ms），但把最坏那一帧收敛了（30 → 15ms 一档）。
+DRAG_THREAD_LOW_PRIORITY = True
+THREAD_PRIORITY_BELOW_NORMAL = -1
 EVENT_SYSTEM_FOREGROUND = 0x0003
 EVENT_OBJECT_LOCATIONCHANGE = 0x800B
 WINEVENT_OUTOFCONTEXT = 0x0000
@@ -180,7 +290,10 @@ WS_EX_NOACTIVATE = 0x08000000
 SWP_NOACTIVATE = 0x0010
 SWP_NOMOVE = 0x0002
 SWP_NOSIZE = 0x0001
+SWP_NOZORDER = 0x0004
 HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+GWL_EXSTYLE = -20            # GetWindowLongW 的索引：取扩展样式（含 WS_EX_TOPMOST）
 
 SW_HIDE = 0
 SW_SHOW = 5
@@ -365,6 +478,7 @@ _proto(user32.IsWindowVisible, [w.HWND], w.BOOL)
 _proto(user32.DestroyWindow, [w.HWND], w.BOOL)
 _proto(user32.SetForegroundWindow, [w.HWND], w.BOOL)
 _proto(user32.SetWindowPos, [w.HWND, w.HWND, c_int, c_int, c_int, c_int, c_uint], w.BOOL)
+_proto(user32.GetWindowLongW, [w.HWND, c_int], c_long)
 _proto(user32.SetFocus, [w.HWND], w.HWND)
 _proto(user32.GetFocus, [], w.HWND)
 _proto(user32.GetClientRect, [w.HWND, POINTER(w.RECT)], w.BOOL)
@@ -422,6 +536,9 @@ _proto(user32.SetWinEventHook, [w.DWORD, w.DWORD, w.HANDLE, WINEVENTPROC,
 _proto(user32.UnhookWinEvent, [w.HANDLE], w.BOOL)
 _proto(user32.SetTimer, [w.HWND, ctypes.c_size_t, w.UINT, c_void_p], ctypes.c_size_t)
 _proto(user32.KillTimer, [w.HWND, ctypes.c_size_t], w.BOOL)
+# explorer 重启后会给所有顶层窗口广播这条消息，收到就得把托盘图标重新挂上去
+# （图标本身跟着进程，但任务栏那一条是 explorer 的内存，重启就没了）。
+_proto(user32.RegisterWindowMessageW, [w.LPCWSTR], w.UINT)
 
 _proto(user32.MapVirtualKeyW, [c_uint, c_uint], c_uint)
 _proto(user32.ReleaseCapture, [], w.BOOL)
@@ -540,6 +657,32 @@ _proto(windll.kernel32.GlobalUnlock, [c_void_p], w.BOOL)
 _proto(windll.kernel32.GlobalFree, [c_void_p], c_void_p)
 _proto(windll.kernel32.GetModuleHandleW, [w.LPCWSTR], w.HINSTANCE)
 _proto(windll.kernel32.GetCurrentProcessId, [], w.DWORD)
+# 预取线程降优先级用。GetCurrentThread 返回的是伪句柄（-2），必须声明成指针
+# 宽度的 HANDLE，否则会被当成 32 位 int 截断成 0xFFFFFFFE 之外的垃圾。
+_proto(windll.kernel32.GetCurrentThread, [], w.HANDLE)
+_proto(windll.kernel32.SetThreadPriority, [w.HANDLE, c_int], w.BOOL)
+# 单实例互斥。用命名互斥而不是「查窗口是否存在」：后者有竞态 —— onefile 要
+# 解压 2~3 秒，这期间窗口还没建，两次双击都能通过检查，结果起两个面板互相抓屏。
+_proto(windll.kernel32.CreateMutexW, [c_void_p, w.BOOL, w.LPCWSTR], w.HANDLE)
+_proto(windll.kernel32.GetLastError, [], w.DWORD)
+ERROR_ALREADY_EXISTS = 183
+MUTEX_NAME = "Local\\SnapLite-SingleInstance"
+_instance_mutex = None      # 单实例互斥的句柄：故意不关，活到进程退出
+
+
+def _lower_this_thread():
+    """把**当前**线程降到 BELOW_NORMAL（抓屏时让主线程先走）。
+
+    BitBlt 那一下会放掉 GIL，此时两个线程在抢 CPU 和 DWM 表面的交出顺序。
+    后台是「慢一点无所谓、别抢主线程」，降一档正好。失败就算了：优先级只
+    影响排队顺序，不影响正确性。"""
+    if not DRAG_THREAD_LOW_PRIORITY:
+        return
+    try:
+        windll.kernel32.SetThreadPriority(
+            windll.kernel32.GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)
+    except Exception:
+        pass
 
 
 # ============================================================ 配色
@@ -550,6 +693,11 @@ C_HINT = 0xFF97A1B1
 C_ACCENT = 0xFF0A84FF          # iOS 系统蓝
 C_ACCENT_HI = 0xFF3D9BFF
 C_HOVER_SOFT = 0x2EFFFFFF
+
+# 「这是我自己」的指纹色：主按钮正常/高亮两种底色。
+# 拖动时靠它判断抓回来的是桌面还是面板本身 —— 玻璃底每帧都在换（窗口位置变了，
+# 背后桌面就不一样），只有 UI 固定在窗口里，按钮那块纯色是唯一不变的锚点。
+SELF_BTN_COLORS = (C_ACCENT, C_ACCENT_HI)
 
 # 独立按钮组（截图后的浮动工具条）—— 版式保持 v1.1.0：每个按钮各自一块，之间留缝。
 # 底色改成半透明：底下垫的是「该位置的桌面模糊图」（_tool_glass_layer），
@@ -712,6 +860,13 @@ def hotkey_label(mod, vk):
 
 
 # ============================================================ 绘图封装
+# 字体全局共享：原来缓存在 GFX 实例上，而 GFX 是每帧新建的 —— 等于每帧
+# 重建 6 个字体（GdipCreateFontFamilyFromName 会枚举字体族，很贵）。
+# 实测一帧 2.80ms 里，文字占 2.0ms；提到全局后掉到 0.3ms 左右。
+# 字体对象全进程只有这么几个，不回收，留到进程结束。
+_FONT_CACHE = {}
+
+
 class GFX:
     """GDI+ 轻量封装"""
 
@@ -727,16 +882,15 @@ class GFX:
         gdip.GdipSetTextRenderingHint(self.g, TEXT_HINT_GRIDFIT)
         gdip.GdipSetPixelOffsetMode(self.g, PIXEL_HALF)
         gdip.GdipSetInterpolationMode(self.g, 7)
-        self._fonts = {}
 
     def close(self):
-        """释放 GDI+ 资源。必须幂等：异常路径上可能被调用两次。"""
+        """释放 GDI+ 资源。必须幂等：异常路径上可能被调用两次。
+
+        字体不在这里删：它们是全进程共享的（见 _FONT_CACHE），删掉会连累
+        别的 GFX。全进程就那几个，留到进程结束。"""
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        for f in self._fonts.values():
-            gdip.GdipDeleteFont(f)
-        self._fonts.clear()
         gdip.GdipDeleteGraphics(self.g)
 
     def __enter__(self):
@@ -888,12 +1042,13 @@ class GFX:
 
     # ---------- 文字
     def _font(self, size_px, bold, fam=None):
-        """按 (字号, 粗体, 字体名) 取字体对象，取过就复用。
+        """按 (字号, 粗体, 字体名) 取字体对象，取过就复用（全进程共享）。
 
-        每帧新建字体会让 GDI+ 句柄一直涨。字体名按 微软雅黑UI → 雅黑 →
-        Segoe UI 依次回退，某些系统缺字体时不至于一个字都画不出来。"""
+        每帧新建字体会让 GDI+ 句柄一直涨，而且慢：GdipCreateFontFamilyFromName
+        要枚举字体族。字体名按 微软雅黑UI → 雅黑 → Segoe UI 依次回退，
+        某些系统缺字体时不至于一个字都画不出来。"""
         key = (round(size_px, 2), bool(bold), fam)
-        f = self._fonts.get(key)
+        f = _FONT_CACHE.get(key)
         if f is not None:
             return f
         names = [fam] if fam else []
@@ -910,7 +1065,7 @@ class GFX:
         gdip.GdipCreateFont(fam_h, float(size_px), 1 if bold else 0, 2, byref(fnt))
         if fam_h:
             gdip.GdipDeleteFontFamily(fam_h)
-        self._fonts[key] = fnt
+        _FONT_CACHE[key] = fnt
         return fnt
 
     def text(self, s, size_px, argb, x, y, ww, hh, align=0, bold=False,
@@ -980,12 +1135,26 @@ def _free_dib(d):
 
 
 def grab_screen(x, y, ww, hh):
-    """返回 (buffer, w, h)，32bpp top-down，BGRA"""
+    """返回 (buffer, w, h)，32bpp top-down，BGRA
+
+    源矩形超出屏幕时 BitBlt **不报错**，越界那几列/几行留成纯黑 —— 面板
+    拖到屏幕边缘就会贴出一条黑边，宽度还随位置伸缩。所以先把源矩形钳到
+    虚拟屏内，只抓相交的那块，缺的边用最近的边缘像素补（见 _fill_edges）。
+    """
     hdc = user32.GetDC(None)
     mem = gdi32.CreateCompatibleDC(hdc)
     bmp = gdi32.CreateCompatibleBitmap(hdc, ww, hh)
     old = gdi32.SelectObject(mem, bmp)
-    gdi32.BitBlt(mem, 0, 0, ww, hh, hdc, x, y, SRCCOPY)
+
+    vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+    vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+    vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+    vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+    sx, sy = max(x, vx), max(y, vy)
+    ex, ey = min(x + ww, vx + vw), min(y + hh, vy + vh)
+    inside = ex > sx and ey > sy
+    if inside:
+        gdi32.BitBlt(mem, sx - x, sy - y, ex - sx, ey - sy, hdc, sx, sy, SRCCOPY)
 
     bi = BITMAPINFO()
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER)
@@ -1001,7 +1170,65 @@ def grab_screen(x, y, ww, hh):
     gdi32.DeleteObject(bmp)
     gdi32.DeleteDC(mem)
     user32.ReleaseDC(None, hdc)
+
+    if not inside:
+        return buf                        # 整块都在屏外：只能给黑的
+    if sx > x or sy > y or ex < x + ww or ey < y + hh:
+        buf = _fill_edges(buf, ww, hh, sx - x, ex - x, sy - y, ey - y)
     return buf
+
+
+def _fill_edges(buf, ww, hh, lx, rx, ty, by):
+    """把越界留白的边用最近的有效像素补上。
+
+    lx/rx 是有效的列区间，ty/by 是有效的行区间（都是相对本块左上角）。
+    补法就是「边缘复制」：越界那几列取最外面那一条有效列，越界那几行取最
+    外面那一条有效行。比留成黑边好得多 —— 黑边在深色面板里一眼就能看见，
+    边缘复制看起来只是背景往屏外延了一点。"""
+    stride = ww * 4
+    b = bytearray(ctypes.string_at(buf, ww * hh * 4))
+    if rx > lx:
+        for yy in range(hh):
+            o = yy * stride
+            if lx > 0:
+                b[o:o + lx * 4] = b[o + lx * 4:o + lx * 4 + 4] * lx
+            if rx < ww:
+                b[o + rx * 4:o + stride] = b[o + (rx - 1) * 4:o + rx * 4] * (ww - rx)
+    if by > ty:
+        if ty > 0:
+            b[0:ty * stride] = b[ty * stride:ty * stride + stride] * ty
+        if by < hh:
+            b[by * stride:hh * stride] = b[(by - 1) * stride:by * stride] * (hh - by)
+    return ctypes.create_string_buffer(bytes(b), len(b))
+
+
+def _quick_luma(buf):
+    """一块 BGRA 的平均亮度，只采约 200 个点（约 0.05ms）。
+
+    拖动中每帧都要调用，所以不能整块扫：200 个点足够看出「某一帧突然掉下去」。"""
+    n = len(buf)
+    if n < 8:
+        return 0.0
+    step = max(52, (n // 800) * 4)
+    tot = cnt = 0
+    for i in range(0, n - 3, step):
+        tot += buf[i] + buf[i + 1] + buf[i + 2]
+        cnt += 3
+    return tot / float(cnt) if cnt else 0.0
+
+
+def _crop_bgra(data, sw, x, y, w, h):
+    """从一块 sw 宽的 BGRA 大图里裁出 (x, y) 起 w×h 的一块（按行拷贝）
+
+    拖动时每帧都要从缓存的大图里裁一块，148 行各拷一次，约 0.05ms ——
+    比现抓一次（BitBlt 要等 DWM 交表面，5.7~27.9ms 不等）便宜两个数量级。"""
+    out = bytearray(w * h * 4)
+    src_w = w * 4
+    for r in range(h):
+        so = ((y + r) * sw + x) * 4
+        do = r * src_w
+        out[do:do + src_w] = data[so:so + src_w]
+    return bytes(out)
 
 
 def buf_to_image(buf, ww, hh):
@@ -1107,7 +1334,12 @@ class Probe(threading.Thread):
     """后台线程查控件矩形。
 
     为什么要单独开线程：某些程序的辅助功能接口会卡上好几秒，放在界面线程里
-    会把整个截图工具冻住。查不到就退回"按窗口"识别，功能不受影响。
+    会把整个截图工具冻住。查不到就退回「按窗口」识别，功能不受影响。
+
+    只在**截图过程中**才有请求，但线程从程序启动就一直活着。所以这里绝不能
+    写成「睡 15ms 轮询」：那是 64 次/秒的空转唤醒，永远不停，静置时那点 CPU
+    几乎全是它 —— 更重要的是它让进程永远进不了深度空闲。改成事件驱动后，
+    没有请求时线程真的在等，一次都不醒。
     """
 
     def __init__(self):
@@ -1117,6 +1349,7 @@ class Probe(threading.Thread):
         self._req = None
         self._res = None
         self._seq = 0
+        self._wake = threading.Event()
         self.ready = False
 
     def request(self, sx, sy):
@@ -1124,6 +1357,7 @@ class Probe(threading.Thread):
         with self._lock:
             self._seq += 1
             self._req = (sx, sy, self._seq)
+        self._wake.set()
         return self._seq
 
     def latest(self):
@@ -1132,28 +1366,36 @@ class Probe(threading.Thread):
             return self._res
 
     def run(self):
-        """线程主循环：有请求就查一次 UI 元素矩形，没有就睡 15ms。
+        """线程主循环：等到有请求才查一次 UI 元素矩形，其余时间在休眠。
 
-        查不到不算错，调用方会退回「按窗口」识别。"""
+        查不到不算错，调用方会退回「按窗口」识别。
+
+        `wait(1.0)` 那 1 秒是兜底，不是轮询：万一哪天 request 里漏了 set，
+        最多晚 1 秒也能自己醒过来，不会把线程永久卡死。正常路径下每秒 0 次
+        唤醒（有请求时立刻醒）。"""
         try:
             ole32.CoInitializeEx(None, 2)      # STA
             self.ready = True
         except Exception:
             return
         while True:
-            with self._lock:
-                item = self._req
-                self._req = None
-            if item is None:
-                time.sleep(0.015)
-                continue
-            rect = None
-            try:
-                rect = msaa_rect(item[0], item[1])
-            except Exception:
+            self._wake.wait(1.0)
+            self._wake.clear()
+            # 一次唤醒把排队的请求做完：鼠标拖得快时可能连着投了好几次，
+            # 只做最新的那次就行，旧的已经被更新的位置取代了。
+            while True:
+                with self._lock:
+                    item = self._req
+                    self._req = None
+                if item is None:
+                    break
                 rect = None
-            with self._lock:
-                self._res = (rect, item[2])
+                try:
+                    rect = msaa_rect(item[0], item[1])
+                except Exception:
+                    rect = None
+                with self._lock:
+                    self._res = (rect, item[2])
 
 
 
@@ -1216,7 +1458,11 @@ class App:
         # 主面板尺寸
         self.MW = self.px(340)
         self.MH = self.px(148)
-        self.RADIUS = self.px(20)
+        # 圆角：20 → 15。收到一圈后四个角的弧线更短，那条 1px 高光在弧线上的
+        # 像素相位抖动也就少了，观感比单纯加粗描边更干净。这个值同时决定
+        # 面板底、棱边描边和四角遮罩，改一处即整套（见 _draw_main /
+        # _apply_round_mask）。
+        self.RADIUS = self.px(15)
 
     def _init_windows(self):
         """三个窗口的句柄（此时都还没创建）和托盘图标数据结构"""
@@ -1224,6 +1470,12 @@ class App:
         self.hwnd_overlay = None
         self.hwnd_tool = None
         self.tray = NOTIFYICONDATAW()
+        # explorer 重启时会广播这条消息（ID 由系统按名字分配，全局唯一）。
+        # 注册失败就是 0，那就当没有这条消息，别拿 0 去比 msg（0 == WM_NULL）。
+        try:
+            self.wm_taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
+        except Exception:
+            self.wm_taskbar_created = 0
 
     def _init_hotkey(self):
         """全局热键组合（读配置）和「正在录制新热键」的临时状态"""
@@ -1291,7 +1543,11 @@ class App:
         self.bmp_shot = self.bmp_dim = self.bmp_back = None
         self.hdc_screen = None
         self._sdc = None               # 常驻的屏幕 DC（见 _get_screen_dc）
+        # 工作线程只能用它自己创建的 DC：GDI 句柄跨线程用会踩到对方的状态
+        self._main_tid = threading.get_ident()
+        self._sdc_threads = {}         # tid -> DC（只给后台线程用）
         self._excl_ok = None           # 能否「抓屏时排除自己」（见 _can_exclude_from_capture）
+        self._excl_owner = None        # 现在这个属性挂在谁名下（见 _excl_acquire）
         self._mos_cache = {}           # 马赛克块的平均色缓存（每次截图重置）
         self._cells_cache = {}         # 马赛克笔迹覆盖的网格（见 _stroke_cells）
 
@@ -1333,24 +1589,65 @@ class App:
         self.mn_glass = None           # 模糊后的桌面底（BGRA 原始字节）
         self.mn_cov = None             # 圆角覆盖率缓存
         self.mn_cov_key = None
+        # 置顶（右上角图钉）。只活在这一次运行里，不写配置 —— 启动一律不置顶，
+        # 免得用户忘了自己开过、还以为别的窗口关不掉。
+        self.topmost = False
+        # 右键菜单弹着的时候为 True：TrackPopupMenu 是阻塞的，它自带的那个消息
+        # 泵会继续派发 WM_TIMER，玻璃底照常抓屏 —— 菜单就盖在面板上，抓回来会
+        # 把菜单自己拍进玻璃底。见 _panel_menu / _tick_glass。
+        self.menu_open = False
 
-        # 拖动中的玻璃底来源：一张全屏缩略图。
-        # 拖窗时每帧都去抓屏是不行的（抓屏前必须先把自己变透明 → 会闪），
-        # 所以改成「拖动开始时抓一整屏、缩到 1/13 存着，之后按新位置从里面裁」。
-        self.drag_small = None         # bytes：全屏缩略图
+        # 拖动中的玻璃底来源，两条路：
+        # - 新系统：每帧现场抓「目标位置」背后那块桌面。窗口还没搬到那里，
+        #   那一块天然不含自己，拿到的是全分辨率真背景（无锯齿、无补丁）。
+        # - 老系统（没有「抓屏排除自己」）：退回整屏缩略图，见 _begin_drag_glass。
+        self.drag_live = False         # True = 走实时抓屏那条路
+        self.drag_small = None         # bytes：全屏缩略图（老系统退路）
         self.drag_small_size = None    # (sw, sh)
         self.drag_scale = (1.0, 1.0)   # 屏幕像素 / 缩略图像素
         self.drag_active = False
         self.drag_last_pos = None      # 上次提交时的窗口位置（位置没变就不重画）
+        # 拖动时的「桌面大图」快照：(x, y, w, h, bytes)，比面板每边大一圈。
+        #
+        # 这张快照由**后台线程**持续刷新（见 _drag_prefetch_loop），主线程每帧
+        # 只从里面裁一块。之所以不能主线程自己抓：抓一次是 5.7~27.9ms 不等，
+        # 那 6ms 全是在等 DWM 交出桌面表面，等待时长随机，于是帧间隔忽长忽短
+        # —— 鼠标是匀速拖的、画面却走走停停，壁纸的弧线边缘对这种不匀最敏感，
+        # 看着就是一道横向水波（纯色块完全看不出来）。
+        #
+        # 快照存的**是桌面本身**，不是「面板某处该显示什么」，所以旧一点没关系：
+        # 只要还盖得住当前窗口位置，裁出来的内容就是对的。
+        self.drag_world = None
+        self.drag_target = None        # 主线程每帧更新：(left, top)，线程据此取景
+        self.drag_step = (0, 0)        # 主线程每帧更新：相对上次提交的位移，决定余量形状
+        self.drag_stat = None          # 这一趟拖动的亮度统计，松手时落盘（见 _drag_stat_flush）
+        self.drag_thread = None        # 预取「抓」线程（单线程模式下是唯一线程）
+        self.drag_thread2 = None       # 预取「模糊」线程（流水线模式才有）
+        self.drag_stop = None          # threading.Event，置位即收工
+        # 流水线：抓线程把新抓的整块放这里，模糊线程取走。元组赋值是原子的，
+        # 所以不需要锁；带序号是为了让模糊线程跳过被自己落下的旧块。
+        self.drag_raw = None
+        self.drag_wake = None          # threading.Event：抓线程有新块时叫醒模糊线程
+        self.DRAG_WORLD_PAD = 96       # 老办法（DRAG_PREFETCH=False）的缓存外扩
 
         # 自己接管的窗口拖动（不走系统拖动循环，位置和背景才能同帧提交）
         self.main_drag = False
         self.main_drag_off = (0, 0)    # 按下时鼠标相对窗口左上角的偏移
 
-        # 玻璃底自动跟随桌面变化（窗口事件钩子 + 低频定时器）
+        # 玻璃底自动跟随桌面变化（窗口事件钩子 + 双档定时器）
         self.glass_hook = None
         self.glass_proc = None         # 回调必须留引用，否则会被 GC 掉
-        self.glass_dirty = False
+        self.glass_dirty = False       # 事件钩子置位：窗口搬家了，下一拍一定重算
+        self.glass_raw = None          # 上一次抓到的原始背景，用来比对画面变没变
+        self.glass_tick_ms = 0         # 当前定时器节拍（0 = 还没起）
+        self.glass_live_until = 0.0    # 活跃档保持到什么时候（time.time()）
+
+        # 活跃档工作线程（见 _glass_live_loop）：抓屏和模糊都在这里做，
+        # 主线程只等消息贴图，于是「等 DWM 出图」那 6ms 不再堵界面。
+        self.glass_thread = None       # threading.Thread
+        self.glass_stop = None         # threading.Event，置位即收工
+        self.glass_slot = None         # 线程算好的帧，等主线程取
+        self.glass_posted = False      # 已投递、还没被主线程取走（防止消息堆积）
 
     def _init_window_procs(self):
         """窗口过程、光标缓存、GDI+ 与窗口类。
@@ -1656,7 +1953,10 @@ class App:
                                                 user32.IsWindowVisible(self.hwnd_main)))
 
     def _main_layout(self):
-        """算主面板上几个控件的矩形：关闭、收到托盘、截图按钮、快捷键行"""
+        """算主面板上几个控件的矩形：关闭、置顶、收到托盘、截图按钮、快捷键行
+
+        右上角从右往左：✕ → — → 图钉。图钉放在最左，跟两个「关窗口」的动作
+        隔开一格，避免手快连点时把置顶当成关闭按下去。"""
         W, H = self.MW, self.MH
         sz = self.px(26)
         gap = self.px(4)
@@ -1664,9 +1964,10 @@ class App:
         by = self.px(11)
         close = (bx, by, sz, sz)
         hide = (bx - gap - sz, by, sz, sz)
+        pin = (bx - (gap + sz) * 2, by, sz, sz)
         btn = (self.px(18), self.px(46), W - self.px(36), self.px(46))
         hot = (self.px(18), self.px(100), W - self.px(36), self.px(30))
-        return close, hide, btn, hot
+        return close, pin, hide, btn, hot
 
     # ---------- 液态玻璃：主窗口用逐像素 alpha 分层表面
     def _paint_main(self, hwnd):
@@ -1688,7 +1989,17 @@ class App:
 
         原来各处写的是 `self.hdc_screen or user32.GetDC(None)` —— 截图之前
         hdc_screen 还是 None，于是每画一帧就 GetDC 一次却从不 ReleaseDC，
-        拖动几十秒就能把进程的 GDI 句柄耗光。"""
+        拖动几十秒就能把进程的 GDI 句柄耗光。
+
+        后台线程走单独一支：DC 里带着选区、映射模式这些「状态」，两个线程
+        共用同一个 DC 会互相覆盖。所以按线程号各建一个，用完一起释放。"""
+        tid = threading.get_ident()
+        if tid != self._main_tid:
+            dc = self._sdc_threads.get(tid)
+            if not dc:
+                dc = user32.GetDC(None)
+                self._sdc_threads[tid] = dc
+            return dc
         if self.hdc_screen:
             return self.hdc_screen
         if not self._sdc:
@@ -1703,6 +2014,12 @@ class App:
             except Exception:
                 pass
             self._sdc = None
+        for dc in list(self._sdc_threads.values()):
+            try:
+                user32.ReleaseDC(None, dc)
+            except Exception:
+                pass
+        self._sdc_threads.clear()
 
     def _ensure_main_surface(self):
         """确保主面板的离屏表面存在、且尺寸与当前 DPI 一致"""
@@ -1767,12 +2084,15 @@ class App:
         self._ensure_main_surface()
         W, H = self.mn_size
         total = W * H * 4
-        ctypes.memset(self.mn_bits, 0, total)
+        glass = self.mn_glass
+        have = bool(glass) and len(glass) == total
+        if have:
+            # 玻璃底整块不透明，直接覆盖；不必先清成透明（拖动时省一笔全缓冲写）
+            ctypes.memmove(self.mn_bits, glass, total)
+        else:
+            ctypes.memset(self.mn_bits, 0, total)
         with GFX(self.mn_dc) as g:
-            glass = self.mn_glass
-            if glass and len(glass) == total:
-                ctypes.memmove(self.mn_bits, glass, total)
-            else:
+            if not have:
                 # 抓不到桌面时退化成实底，保证文字一定可读
                 g.fill_round(0xFF14161A, 0, 0, W, H, self.RADIUS)
             self._draw_main(g, W, H)
@@ -1833,7 +2153,9 @@ class App:
             gdi32.BitBlt(self.dc_shot, dx, dy, ww, hh, self.mn_keep[0], sx, sy, SRCCOPY)
 
     def _refresh_glass(self, blank=True):
-        """抓主窗口背后的真实桌面 → 模糊 → 当玻璃底。"""
+        """抓主窗口背后的真实桌面 → 模糊 → 当玻璃底。
+
+        blank=True 时先提交一帧全透明再抓，所以抓到的一定是桌面本身。"""
         if not self.hwnd_main:
             return
         W, H = self.MW, self.MH
@@ -1845,18 +2167,17 @@ class App:
                 pass
         rc = w.RECT()
         user32.GetWindowRect(self.hwnd_main, byref(rc))
-        raw = None
+
+        def _grab(gx, gy, gw, gh, probe):
+            # 窗口已经在上一步提交成全透明，不需要再设「抓屏排除自己」
+            return grab_screen(gx, gy, gw, gh).raw
+
         try:
-            raw = grab_screen(rc.left, rc.top, W, H).raw
+            # 四周多留一圈再模糊：抓的区域正好等于面板大小时，模糊会在四条边上
+            # 留下暗一半的边（原因见 _blur_behind），静止时就是那圈「内侧阴影」
+            self.mn_glass = self._blur_behind(rc.left, rc.top, grab=_grab)
         except Exception as e:
-            dbg("glass grab failed: %r" % (e,))
-        if raw and len(raw) == W * H * 4:
-            try:
-                self.mn_glass = self._blur_bgra(raw, W, H)
-            except Exception as e:
-                dbg("glass blur failed: %r" % (e,))
-                self.mn_glass = None
-        else:
+            dbg("glass grab/blur failed: %r" % (e,))
             self.mn_glass = None
         self._present_main()
 
@@ -1877,31 +2198,303 @@ class App:
                 dbg("SetWinEventHook 失败，玻璃底不会自动跟随")
         except Exception as e:
             dbg("SetWinEventHook 异常: %r" % (e,))
-        user32.SetTimer(self.hwnd_main, TIMER_GLASS, GLASS_TICK_MS, None)
+        self._set_glass_tick(GLASS_TICK_IDLE)
+
+    def _set_glass_tick(self, ms):
+        """切换定时器节拍。同一个 ID 重设会顶掉旧的，不需要先 KillTimer"""
+        if ms == self.glass_tick_ms:
+            return
+        self.glass_tick_ms = ms
+        user32.SetTimer(self.hwnd_main, TIMER_GLASS, ms, None)
+
+    def _settle_glass_tick(self):
+        """这一拍画面没变 —— 活跃档过期了就退回空闲档，省掉没必要的完整刷新"""
+        if time.time() < self.glass_live_until:
+            return
+        self._set_glass_tick(GLASS_TICK_IDLE)
 
     def _on_desktop_event(self, hook, event, hwnd, idobj, idchild, thread, ms):
-        # 处在截图流程里时不需要跟（遮罩盖着，主面板也停在透明帧）
         """桌面窗口事件回调。
 
         只置一个标记就走，绝不在这里干重活 —— 拖动一个窗口会瞬间产生几百个
-        事件，每个都重算玻璃底会把界面卡死。真正重算交给定时器（_tick_glass）。"""
+        事件，每个都重算玻璃底会把界面卡死。真正重算交给定时器（_tick_glass）。
+        处在截图流程里时不需要跟（遮罩盖着，主面板也停在透明帧）。"""
         if not self.capturing:
             self.glass_dirty = True
         return None
 
-    def _tick_glass(self):
-        """定时器：桌面变过就重算一次玻璃底（空闲时一帧都不多算）"""
-        if not self.glass_dirty:
+    def _on_display_change(self):
+        """分辨率 / 显示器插拔 / 缩放变了。
+
+        不处理的话有两个后果：把分辨率调小（或者拔掉外接屏）之后，面板可能整块
+        落在新屏幕之外 —— 你看不见它，也没法把它拖回来，只能按热键截图或者重启；
+        玻璃底也还按旧坐标抓，会抓到别处的内容。
+
+        只做两件事：把窗口拉回可视区、把玻璃底标脏重抓。面板的像素尺寸不跟着变
+        （本来就该是固定的物理尺寸）；改 DPI 缩放才需要重建字体和表面，那种情况
+        目前要重启才干净，先不在这里硬做。"""
+        if not self.hwnd_main:
             return
-        self.glass_dirty = False
+        try:
+            if self.capturing:
+                # 遮罩是按旧屏幕尺寸铺的，继续框选会错位，先收掉
+                self._abort_capture()
+            vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+            vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+            vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+            vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+            self.vs = (vx, vy, vw, vh)
+            rc = w.RECT()
+            user32.GetWindowRect(self.hwnd_main, byref(rc))
+            W, H = self.mn_size or (self.MW, self.MH)
+            left = max(vx, min(rc.left, vx + vw - W))
+            top = max(vy, min(rc.top, vy + vh - H))
+            if (left, top) != (rc.left, rc.top):
+                user32.SetWindowPos(self.hwnd_main, None, left, top, 0, 0,
+                                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE)
+                dbg("display change: moved to (%d,%d)" % (left, top))
+            # 坐标系变了，所有按旧坐标抓到的像素一律作废
+            self.glass_raw = None
+            self.glass_dirty = True
+            self.drag_world = None
+            self._present_main()
+        except Exception as e:
+            dbg("display change failed: %r" % (e,))
+
+    def _tick_glass(self):
+        """定时器：桌面内容真的变了才重算玻璃底，没变什么都不做。
+
+        以前的判据只有「别的窗口搬家 / 切换前台」这一类事件，而视频播放、
+        网页动画、滚动这些「画面自己在变」的情况**不产生任何窗口事件** ——
+        于是玻璃底会一直停在很久以前那一帧，看起来像卡死了。
+
+        现在每拍都轻抓一次做比对：抓屏 6ms、比内存 0.02ms，一样就直接返回，
+        不模糊也不重画；确认变了就把活跃档交给后台线程（_glass_live_loop）——
+        它跟着屏幕垂直消隐出帧，帧间隔永远是整数个刷新周期，不会出现拍频。"""
         if (not self.hwnd_main or self.capturing or self.main_drag
-                or self.drag_active or self.recording):
+                or self.drag_active or self.recording or self.menu_open):
             return
         if not user32.IsWindowVisible(self.hwnd_main):
             return
         if user32.IsIconic(self.hwnd_main):
             return
-        self._refresh_glass_live()
+        if self._glass_thread_alive():
+            # 线程在跟，主线程不插手：两边同时抓屏只会互相拖慢
+            return
+
+        block = self._grab_glass_block()
+        if block is None:
+            # 老系统（Win10 2004 之前）没有「抓屏时排除自己」，走插值那条路
+            # 拿不到可比对的原始像素，只能退回「事件置位才刷新」的老逻辑。
+            if not self.glass_dirty:
+                self._settle_glass_tick()
+                return
+            self.glass_dirty = False
+            self._refresh_glass_live()
+            return
+        raw, ox, oy, gw, gh = block
+
+        # 窗口搬家 / 切前台已经说明画面一定变了，这一拍省掉比对直接重算
+        forced = self.glass_dirty
+        self.glass_dirty = False
+        if not forced and raw == self.glass_raw:
+            self._settle_glass_tick()
+            return
+
+        self.glass_raw = raw
+        if self._start_glass_live():
+            # 线程接手：这一帧连同后续都由它算，主线程立刻回去处理消息
+            return
+        try:
+            glass = self._blur_crop(raw, gw, gh, ox, oy)
+        except Exception as e:
+            dbg("glass blur failed: %r" % (e,))
+            glass = None
+        if not glass:
+            return
+        self.mn_glass = glass
+        self._present_main()
+        self.glass_live_until = time.time() + GLASS_LIVE_HOLD
+        self._set_glass_tick(GLASS_TICK_LIVE)
+
+    # ---------- 活跃档：后台线程跟着垂直消隐出帧
+    def _glass_thread_alive(self):
+        """活跃档线程是不是还在跑"""
+        th = self.glass_thread
+        return bool(th and th.is_alive())
+
+    def _start_glass_live(self):
+        """确认桌面在变了：把抓屏 + 模糊交给后台线程，返回是否成功接手。
+
+        线程只做「等消隐 → 抓 → 模糊 → 把帧放到 slot → 叫主线程贴」，
+        窗口和 UpdateLayeredWindow 仍然只有主线程碰。"""
+        if not GLASS_USE_LIVE_THREAD:
+            return False
+        if not self.hwnd_main or not self._can_exclude_from_capture():
+            return False
+        if self._glass_thread_alive():
+            return True
+        self.glass_stop = threading.Event()
+        self.glass_slot = None
+        self.glass_posted = False
+        self.glass_thread = threading.Thread(
+            target=self._glass_live_loop, args=(self.glass_stop,),
+            name="glass-live", daemon=True)
+        self.glass_thread.start()
+        # 线程在跑的时候定时器只当心跳，退回低频；线程收工会再调回来
+        self._set_glass_tick(GLASS_TICK_IDLE)
+        return True
+
+    def _stop_glass_live(self, wait=0.5):
+        """叫停活跃档线程并等它退出（退出、截图、拖动收尾时用）"""
+        stop = self.glass_stop
+        th = self.glass_thread
+        if stop:
+            stop.set()
+        if th and th.is_alive() and th is not threading.current_thread():
+            th.join(wait)
+        self.glass_thread = None
+        self.glass_stop = None
+        self.glass_slot = None
+        self.glass_posted = False
+
+    def _glass_live_loop(self, stop):
+        """后台线程：抓屏 → 变了就模糊 → 交给主线程贴上去，跑到没人看为止。
+
+        节拍不写死毫秒数，也不强行对齐垂直消隐，而是「一轮做完立刻做下一轮」。
+        这是实测出来的选择，反直觉但有数据（166Hz 屏，340×148）：
+
+            每轮先 DwmFlush 等消隐   58.7 帧/秒  间隔 16.38ms（2.72 个周期）顿挫 17.0Hz
+            不等，跑满               85.0 帧/秒  间隔  8.75ms（1.45 个周期）顿挫 51.9Hz
+
+        原本以为「等消隐 = 帧间隔整数倍 = 没有拍频」，实际不是：DwmFlush 返回
+        之后还要抓（约 7ms）、模糊（2ms）、再绕一趟消息到主线程贴图，落点早就
+        偏开了；多等的这一拍只是白花时间，帧率还掉三分之一。反而不等更快，
+        快到位之后帧间隔只有 1.45 个周期，多出来的零点几次刷新每 1~2 帧就
+        轮到一次 —— 顿挫频率 52Hz，眼睛根本分辨不出。
+
+        跟拖动那条路是一回事：拖动也是「来一次算一次」，实测 108 帧、58Hz，
+        你看着是顺的。两处用同一种节奏，观感才一致。
+
+        画面静止超过 GLASS_LIVE_HOLD 就收工，把探测交回低频定时器 —— 没人
+        在看的时候不该一直占着 GPU 合成。
+
+        「抓屏排除自己」在这个线程活着的时候是**常设**的，不是每抓一次设一次：
+        设完属性要等 DWM 重新合成一帧才生效，抓完立刻恢复的话下一轮又得重来，
+        等于每帧白等 7ms（实测 61 帧，且间隔忽长忽短）。常设之后一轮只要
+        抓（7ms）+ 模糊（2ms），实测 85 帧、顿挫频率 52Hz。
+        代价：线程活着这几秒内，别的截图工具拍不到主面板 —— 松手/画面停下
+        一秒后线程就收工、属性立刻恢复。截图、拖动、录屏进来时线程都会先让路。"""
+        W, H = self.MW, self.MH
+        last_raw = None            # None = 还没有基准，第一帧一定算「变了」
+        idle_since = None
+        hwnd0 = self.hwnd_main
+        # 属性可能正被拖动占着：那就直接用（acquire 不会抢归属）
+        excluded = self._excl_acquire("live")
+        if excluded and self._excl_owner == "live":
+            try:
+                dwmapi.DwmFlush()   # 等一帧让属性真正生效
+            except Exception:
+                pass
+        try:
+            while not stop.is_set():
+                if (self.capturing or self.recording or self.main_drag
+                        or self.drag_active):
+                    idle_since = None
+                    stop.wait(0.02)
+                    continue
+                hwnd = self.hwnd_main
+                if (not hwnd or not user32.IsWindowVisible(hwnd)
+                        or user32.IsIconic(hwnd)):
+                    # 收进托盘 / 最小化：看不见就别跟了，直接收工。留着跑的话
+                    # 「抓屏排除自己」会一直挂着，退出时也没人叫停。
+                    break
+                block = self._grab_live_frame(W, H)
+                if block is None:
+                    # 抓不到（属性没生效 / 窗口刚隐藏）就下一轮再试，别把线程耗死
+                    stop.wait(0.02)
+                    continue
+                raw, ox, oy, gw, gh = block
+                if raw == last_raw:
+                    now = time.time()
+                    if idle_since is None:
+                        idle_since = now
+                    if now - idle_since >= GLASS_LIVE_HOLD:
+                        break              # 画面静止了，交回低频探测
+                    continue               # 没变就不模糊，直接下一轮
+                idle_since = None
+                last_raw = raw
+                self.glass_raw = raw
+                try:
+                    glass = self._blur_crop(raw, gw, gh, ox, oy)
+                except Exception as e:
+                    dbg("live glass blur failed: %r" % (e,))
+                    continue
+                if not glass or stop.is_set():
+                    continue
+                self.glass_slot = glass
+                if not self.glass_posted:
+                    # 只投一份：主线程忙的时候帧会过期，堆一串消息只会越贴越旧
+                    self.glass_posted = True
+                    try:
+                        user32.PostMessageW(hwnd, WM_GLASS_FRAME, 0, 0)
+                    except Exception:
+                        self.glass_posted = False
+        finally:
+            # 只归还自己那份：拖动还没松手时，属性要继续留着给它用
+            if excluded:
+                self._excl_release("live")
+        hwnd = self.hwnd_main
+        if hwnd:
+            try:
+                user32.PostMessageW(hwnd, WM_GLASS_FRAME, 1, 0)   # 通知主线程收工
+            except Exception:
+                pass
+
+    def _grab_live_frame(self, W, H):
+        """线程用：抓「面板 + 留白」那一整块（属性已由线程常设，不再每抓一次设一次）。
+
+        仍然顺手校验一次「像不像自己」：属性刚设上或窗口刚被唤醒时，偶尔还会
+        抓到面板本身。抓到就丢掉这一帧（下一轮再说），不在这里重抓 —— 重抓要
+        再等一个合成周期，一帧的成本直接翻倍，宁可掉一帧也不要拖慢整条流水线。
+
+        返回 (raw, ox, oy, gw, gh)，见 _grab_glass_block。"""
+        if not self._can_exclude_from_capture():
+            return None
+        rc = w.RECT()
+        user32.GetWindowRect(self.hwnd_main, byref(rc))
+        gx, gy, gw, gh = self._glass_rect(rc.left, rc.top)
+        ox = max(0, min(rc.left - gx, gw - W))
+        oy = max(0, min(rc.top - gy, gh - H))
+        try:
+            raw = grab_screen(gx, gy, gw, gh).raw
+        except Exception as e:
+            dbg("live grab failed: %r" % (e,))
+            return None
+        if not raw or len(raw) != gw * gh * 4:
+            return None
+        if self._looks_like_me_at(raw, gw, gh, (ox, oy, W, H)):
+            return None
+        return raw, ox, oy, gw, gh
+
+    def _glass_frame_ready(self):
+        """主线程：把线程算好的那一帧贴上去（只做提交，约 3ms）"""
+        self.glass_posted = False
+        glass = self.glass_slot
+        self.glass_slot = None
+        if not glass:
+            return
+        if self.main_drag:
+            # 这条消息是线程**在拖动开始之前**投出来的，画面还是旧位置那块的。
+            # 拖动中位置只由 _drag_frame 搬（位置和内容同一次提交），这里再贴
+            # 一帧就成了「窗口已经到新位置、玻璃还是老地方的」—— 背景在面板里
+            # 往后滑一截。纯色背景看不出来，有细纹的地方就是一道水波。
+            # 丢掉它：松手后 _end_drag_glass 会置脏并重启线程，不差这一帧。
+            return
+        self.mn_glass = glass
+        self.glass_dirty = False
+        self.glass_live_until = time.time() + GLASS_LIVE_HOLD
+        self._present_main()
 
     def _can_exclude_from_capture(self):
         """当前系统能不能「抓屏时把自己排除掉」（Win10 2004 / build 19041 起）。
@@ -1913,31 +2506,189 @@ class App:
             self._excl_ok = win_build() >= CAPTURE_EXCLUDE_MIN_BUILD
         return self._excl_ok
 
+    def _excl_acquire(self, owner):
+        """把「抓屏排除自己」挂到某个名下；已经在自己名下就不重复设。
+
+        为什么要有「归属」：这个属性有三处会用 —— 空闲探测（抓完就还）、
+        活跃线程（活着期间常设）、拖动（整段占用）。三者各自 set/clear 的话，
+        谁清谁的时序一错，就会在别人抓屏的那一刻被清回 0，抓回来的是面板
+        自己；模糊后整块发暗，下一帧又恢复 —— 就是「界面不动，自己黑一下」。
+        加归属之后，只有当初设它的那个人能清，别人清不动。
+        """
+        if not self.hwnd_main or not self._can_exclude_from_capture():
+            return False
+        if self._excl_owner:
+            # 已经有人在用了：属性本来就是开着的，直接用，但不抢归属。
+            # 抢过来的话，对方一松手就会把属性清掉，而另一方正在抓屏 ——
+            # 于是抓回面板自己，模糊后整块发暗。归属就是防这个的。
+            return True
+        try:
+            ok = bool(user32.SetWindowDisplayAffinity(
+                self.hwnd_main, WDA_EXCLUDEFROMCAPTURE))
+        except Exception:
+            ok = False
+        if ok:
+            self._excl_owner = owner
+        return ok
+
+    def _excl_release(self, owner):
+        """归还属性。不是自己的就别动 —— 别人（拖动/线程）正在靠它抓背景。"""
+        if self._excl_owner != owner:
+            return
+        self._excl_owner = None
+        try:
+            user32.SetWindowDisplayAffinity(self.hwnd_main, WDA_NONE)
+        except Exception:
+            pass
+
+    def _excl_reset(self):
+        """无条件清掉（退出时用，不管现在挂在谁名下）"""
+        self._excl_owner = None
+        if not self.hwnd_main:
+            return
+        try:
+            user32.SetWindowDisplayAffinity(self.hwnd_main, WDA_NONE)
+        except Exception:
+            pass
+
     def _looks_like_self(self, raw, ww, hh):
         """这次抓回来的画面，是不是「面板自己」（说明排除属性没赶上这一帧）。
 
         只比中间 60% 一块：边缘可能掺进邻接的背景，中间那块一定被面板盖着。
         阈值 8 是实测出来的：排除成功时与面板差 79，抓到面板本身时只有 0~5。
-        判据拿不到面板像素时返回 False（当作成功），不因为校验本身失败而卡住。"""
+        判据拿不到面板像素时返回 False（当作成功），不因为校验本身失败而卡住。
+
+        取样而不是整块拷：这条判据在拖动时每帧都要走一次，拷 200KB 白花
+        时间。中间 60% 里每 8 行取一行、每 4 个像素取一个，约 400 个样本，
+        足够判「像不像自己」。"""
         if not self.mn_bits or self.mn_size != (ww, hh):
             return False
-        try:
-            mine = ctypes.string_at(self.mn_bits, ww * hh * 4)
-        except Exception:
+        base = self.mn_bits.value
+        if not base:
             return False
+        stride = ww * 4
         x0, x1 = ww // 5, ww * 4 // 5
         y0, y1 = hh // 5, hh * 4 // 5
         tot = cnt = 0
-        for y in range(y0, y1, 4):
-            for x in range(x0, x1, 4):
-                o = (y * ww + x) * 4
-                tot += (abs(raw[o] - mine[o]) + abs(raw[o + 1] - mine[o + 1])
-                        + abs(raw[o + 2] - mine[o + 2]))
-                cnt += 3
+        try:
+            for y in range(y0, y1, 8):
+                off = y * stride + x0 * 4
+                row = ctypes.string_at(base + off, (x1 - x0) * 4)
+                for i in range(0, len(row) - 3, 16):
+                    o = off + i
+                    tot += (abs(raw[o] - row[i]) + abs(raw[o + 1] - row[i + 1])
+                            + abs(raw[o + 2] - row[i + 2]))
+                    cnt += 3
+        except Exception:
+            return False
         return bool(cnt) and (tot / float(cnt)) < 8.0
 
-    def _grab_without_self(self, left, top, ww, hh):
+    def _self_btn_rect(self):
+        """「这是我自己」的取样框：主按钮里一段纯色区域，窗口坐标。
+
+        取按钮宽度 62%~72% 那一段：左边是「开始截图」文字、右边是取景角标，
+        两头都避开，中间是干净的实心蓝。纵向取中间 35%~65%，避开圆角。"""
+        W, H = self.MW, self.MH
+        b = self._main_layout()[3]
+        x0 = b[0] + b[2] * 0.62
+        x1 = b[0] + b[2] * 0.72
+        y0 = b[1] + b[3] * 0.35
+        y1 = b[1] + b[3] * 0.65
+        x0 = max(0, min(W - 2, int(x0)))
+        x1 = max(x0 + 1, min(W, int(x1)))
+        y0 = max(0, min(H - 2, int(y0)))
+        y1 = max(y0 + 1, min(H, int(y1)))
+        return x0, x1, y0, y1
+
+    def _is_self_tile(self, buf, W, H):
+        """这块画面里是不是「我自己」—— 只看主按钮那段纯色对不对得上。
+
+        为什么不能只靠 _looks_like_self（与 mn_bits 逐像素比）：拖动中 mn_bits
+        里的玻璃底是**另一个位置**的桌面，而「抓到面板自己」那张带的是面板当时
+        显示的背景，两者对不上 → 校验放行 → 把自己模糊一遍贴上去，整块发暗，
+        就是「界面黑一下」。位置越随机越容易撞上，所以这症状位置随机、整块变暗。
+
+        玻璃底每帧都在换，只有 UI 固定在窗口里，所以改用按钮那段纯蓝当锚点：
+        抓到自己必然是它，抓到桌面几乎不可能撞出同一种蓝（撞上也只是白丢一帧，
+        退化成补抓，不会发黑）。"""
+        if not buf or len(buf) != W * H * 4:
+            return False
+        x0, x1, y0, y1 = self._self_btn_rect()
+        tb = tg = tr = 0
+        n = 0
+        stride = W * 4
+        for y in range(y0, y1):
+            o = y * stride + x0 * 4
+            row = buf[o:o + (x1 - x0) * 4]
+            for k in range(0, len(row) - 3, 4):
+                tb += row[k]
+                tg += row[k + 1]
+                tr += row[k + 2]
+                n += 1
+        if not n:
+            return False
+        tb /= float(n)
+        tg /= float(n)
+        tr /= float(n)
+        for c in SELF_BTN_COLORS:
+            d = (abs(tb - (c & 0xFF)) + abs(tg - ((c >> 8) & 0xFF))
+                 + abs(tr - ((c >> 16) & 0xFF)))
+            if d < 46.0:
+                return True
+        return False
+
+    def _looks_like_me(self, buf, W, H):
+        """抓回来的画面是不是面板自己 —— 两种判据取并集。
+
+        - `_looks_like_self`：与当前画面逐像素比，窗口**不动**时最准；
+        - `_is_self_tile`：看主按钮那段纯色，窗口**在动**时也有效。
+
+        拖动必须走第二个：那时候 mn_bits 里的玻璃底已经是旧位置的桌面，
+        第一个判据会漏判（漏判 = 面板黑一下）。"""
+        return (self._looks_like_self(buf, W, H)
+                or self._is_self_tile(buf, W, H))
+
+    def _crop_bgra(self, buf, ww, px, py, pw, ph):
+        """从 stride=ww 的 BGRA 大块里裁一块出来（按行拷，纯字节操作）。
+
+        抓「面板 + 四周留白」之后，凡是原来按面板大小写死的判断（像不像自己、
+        模糊后裁中心）都要先裁出面板那一片，统一走这里。"""
+        if px == 0 and pw == ww:
+            return bytes(buf[:pw * ph * 4])
+        out = bytearray(pw * ph * 4)
+        for y in range(ph):
+            so = ((y + py) * ww + px) * 4
+            out[y * pw * 4:(y + 1) * pw * 4] = buf[so:so + pw * 4]
+        return bytes(out)
+
+    def _looks_like_self_at(self, raw, ww, hh, probe):
+        """在 raw 里取出 probe 那一块，再和面板当前画面比「像不像自己」。
+
+        为什么要单独有这么一个：抓的区域比面板大（外扩留白，见 _blur_behind）
+        时，`_looks_like_self` 一看尺寸对不上就直接返回 False（当作成功），
+        这道校验等于白设。先把中间那块裁出来再比，语义和只抓面板大小一样。
+
+        probe 是 (x, y, w, h)，相对 raw 左上角；传 None 或整块就退回原判据。"""
+        if not probe:
+            return self._looks_like_self(raw, ww, hh)
+        px, py, pw, ph = probe
+        if (px, py, pw, ph) == (0, 0, ww, hh):
+            return self._looks_like_self(raw, ww, hh)
+        if px < 0 or py < 0 or px + pw > ww or py + ph > hh:
+            return False
+        return self._looks_like_self(self._crop_bgra(raw, ww, px, py, pw, ph), pw, ph)
+
+    def _looks_like_me_at(self, raw, ww, hh, probe):
+        """同上的整版判据（含「面板自己在动」时也有效的按钮纯色那一招）。"""
+        px, py, pw, ph = probe
+        buf = self._crop_bgra(raw, ww, px, py, pw, ph)
+        return self._looks_like_me(buf, pw, ph)
+
+    def _grab_without_self(self, left, top, ww, hh, probe=None):
         """抓 (left, top) 处 ww×hh —— 画面里不含本窗口。失败返回 None。
+
+        probe 指定「拿哪一块做自检」，默认整块。抓的区域比面板大时（外扩留白）
+        必须传面板那一块，否则尺寸对不上，自检会直接放行（见 _looks_like_self_at）。
 
         只在抓的这一小段里把窗口标成「抓屏时排除」，抓完立刻恢复：这个属性
         对系统里所有抓屏程序都生效，不能常驻，否则别的截图工具也拍不到它。
@@ -1948,37 +2699,62 @@ class App:
         时候本来就已经生效，白等一帧要多花 16ms。"""
         for attempt in range(2):
             raw = None
+            if not self._excl_acquire("tick"):
+                return None
             try:
-                user32.SetWindowDisplayAffinity(self.hwnd_main, WDA_EXCLUDEFROMCAPTURE)
-                try:
-                    if attempt:
-                        try:
-                            dwmapi.DwmFlush()      # 等这一帧把面板从合成里摘掉
-                        except Exception:
-                            pass
-                    raw = grab_screen(left, top, ww, hh).raw
-                finally:
-                    user32.SetWindowDisplayAffinity(self.hwnd_main, WDA_NONE)
+                if attempt:
+                    try:
+                        dwmapi.DwmFlush()      # 等这一帧把面板从合成里摘掉
+                    except Exception:
+                        pass
+                raw = grab_screen(left, top, ww, hh).raw
             except Exception as e:
                 dbg("grab without self failed: %r" % (e,))
-                return None
-            if raw and len(raw) == ww * hh * 4 and not self._looks_like_self(raw, ww, hh):
+                raw = None
+            finally:
+                self._excl_release("tick")
+            if raw and len(raw) == ww * hh * 4 \
+                    and not self._looks_like_self_at(raw, ww, hh, probe):
                 return raw
         dbg("抓背景两次都抓到自己，改用插值路径")
         return None
 
+    def _grab_glass_block(self):
+        """抓「面板 + 四周留白」那块桌面，返回 (raw, ox, oy, gw, gh)。
+
+        raw 是 gw×gh 的原始 BGRA，面板在其中的落点是 (ox, oy)。抓不到、
+        或者抓到的是面板自己，都返回 None。
+
+        留白的理由见 _blur_behind（不留白的话模糊会在面板四条边上留下一圈
+        暗边）。单独给一个「只抓不模糊」的入口，是为了让定时器能「先比对、再
+        决定要不要模糊」—— 抓一次 6ms，比对只要 0.02ms，桌面没变时不必付
+        模糊和重画的钱。"""
+        if not self._can_exclude_from_capture():
+            return None
+        W, H = self.MW, self.MH
+        rc = w.RECT()
+        user32.GetWindowRect(self.hwnd_main, byref(rc))
+        gx, gy, gw, gh = self._glass_rect(rc.left, rc.top)
+        ox = max(0, min(rc.left - gx, gw - W))
+        oy = max(0, min(rc.top - gy, gh - H))
+        # 抓的是一整块，交给 _grab_without_self 去重试 + 自检（只看面板那一片）
+        raw = self._grab_without_self(gx, gy, gw, gh, probe=(ox, oy, W, H))
+        if not raw or len(raw) != gw * gh * 4:
+            return None
+        return raw, ox, oy, gw, gh
+
     def _live_glass_excluded(self, W, H):
         """走「排除自己」这条路：抓到的是背后的真实桌面，模糊一下就能用。
 
-        实测与「面板透明后直抓」逐像素差 0.1，耗时不到 5ms（旧的插值路径要
-        13ms，而且中间内容是假的）。"""
+        实测与「面板透明后直抓」逐像素差 0.1（旧的插值路径要 13ms，而且中间
+        内容是推算出来的假的）。
+
+        抓的范围比面板大一圈（见 _blur_behind）：不放大直接模糊的话，模糊会在
+        面板四条边上留下一圈暗边 —— 静止时看到的就是那个。"""
         rc = w.RECT()
         user32.GetWindowRect(self.hwnd_main, byref(rc))
-        raw = self._grab_without_self(rc.left, rc.top, W, H)
-        if not raw or len(raw) != W * H * 4:
-            return None
         try:
-            return self._blur_bgra(raw, W, H)
+            return self._blur_behind(rc.left, rc.top)
         except Exception as e:
             dbg("live glass blur failed: %r" % (e,))
             return None
@@ -2110,6 +2886,80 @@ class App:
     # ---------- 拖动中的实时玻璃：全屏缩略图 + 按位置裁剪
     BLUR_F = 13          # 模糊强度：缩到 1/13 再放回来
 
+    def _glass_rect(self, left, top):
+        """算「模糊该抓哪一块」：包住面板、四周各留 BLUR_F，起点和宽高都对齐到
+        BLUR_F 的整数倍。
+
+        对齐有两个用处：
+        · 降采样网格永远落在屏幕同一套格线上，静止和拖动算出来的条纹位置一致
+          —— 刚按下拖动那一下不会跳一格（完整推导见 _drag_world_rect）；
+        · 尺寸取整数倍，`W // BLUR_F` 才精确等于 BLUR_F，比例不偏。
+
+        贴边时以「盖住面板」优先，钳进虚拟屏。屏幕小到连「面板 + 两侧留白」都
+        装不下（拔掉外接屏、面板比屏幕还宽）就退回不留白，由 _blur_behind 原样用。
+        """
+        W, H = self.MW, self.MH
+        f = self.BLUR_F
+        vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+
+        gw = min((W + 2 * f + f - 1) // f * f, vw // f * f)
+        gh = min((H + 2 * f + f - 1) // f * f, vh // f * f)
+        if gw < W or gh < H:
+            return left, top, W, H                 # 装不下，别硬凑
+        gx = max(vx, min((left - f) // f * f, vx + vw - gw))
+        gy = max(vy, min((top - f) // f * f, vy + vh - gh))
+        return gx, gy, gw, gh
+
+    def _blur_behind(self, left, top, grab=None):
+        """抓 (left, top) 处面板大小的**玻璃底**：四周多留一圈再模糊，裁回中心。
+
+        为什么必须外扩 —— 这是「静止时边缘内侧一圈阴影」的唯一原因：
+
+        `_blur_bgra` 是「缩到 1/BLUR_F 再放回来」。降采样时，输入位图最外一圈
+        的采样会伸到位图外面，那里没有像素，GDI+ 按黑色补。于是模糊结果的四条
+        边正好暗一半（纯灰 128 进去，最外一行出来是 63），往里约 10px 才渐次
+        恢复。抓的区域如果正好等于面板大小，这条暗边就正好压在面板边上，看起来
+        就是「边缘内侧一圈阴影」。
+
+        拖动那条路（_grab_behind）从一张更大的快照里裁，裁切点碰不到边界，所以
+        一直是干净的 —— 这就是「一动不动有阴影、一拖动就没了」的全部原因，和
+        透明无关（面板本体是不透明的）。
+
+        外扩 BLUR_F 之后那条暗边落在面板外面，裁切时被扔掉：边缘偏差从
+        63/128 降到 2/255 以内，四边对称。代价约 +0.7ms（2.25 → 2.91ms），
+        静止路径 250ms 一拍，不在拖动热路径上。
+
+        `grab(gx, gy, gw, gh, probe) -> 原始 BGRA 或 None`；默认走「抓屏排除
+        自己」。`_refresh_glass` 已经先把窗口提交成全透明帧，那里可以直接给一个
+        裸 grab，省掉一次窗口属性设置。
+        """
+        W, H = self.MW, self.MH
+        gx, gy, gw, gh = self._glass_rect(left, top)
+        ox = max(0, min(left - gx, gw - W))
+        oy = max(0, min(top - gy, gh - H))
+        if grab is None:
+            raw = self._grab_without_self(gx, gy, gw, gh, probe=(ox, oy, W, H))
+        else:
+            raw = grab(gx, gy, gw, gh, (ox, oy, W, H))
+        if not raw or len(raw) != gw * gh * 4:
+            return None
+        return self._blur_crop(raw, gw, gh, ox, oy)
+
+    def _blur_crop(self, raw, gw, gh, ox, oy):
+        """把已经抓好的「面板 + 留白」整块模糊，再裁出面板那一片。
+
+        抓和模糊分开，是为了让调用方能拿 raw 做逐字节比对（判断桌面画面变没变）
+        —— 比的和模糊的必须是同一块像素，否则会出现「以为没变、其实画面已经换
+        了」这种错判。"""
+        W, H = self.MW, self.MH
+        big = self._blur_bgra(raw, gw, gh)
+        if ox == 0 and oy == 0 and (gw, gh) == (W, H):
+            return big                             # 没留白（屏幕装不下），原样用
+        return self._crop_bgra(big, gw, ox, oy, W, H)
+
     def _begin_drag_glass(self):
         """开始拖动：趁窗口还在原位，抓一整屏桌面存成缩略图。
 
@@ -2199,11 +3049,77 @@ class App:
             dbg("patch own window failed: %r" % (e,))
             return small
 
+    def _drag_stat_begin(self):
+        """拖动开始：清空这一趟的亮度统计"""
+        self.drag_stat = {"n": 0, "grab": 0, "lo": 999.0, "hi": -1.0, "seq": []}
+
+    def _drag_stat_note(self, glass):
+        """拖动中每帧记一笔「玻璃底有多亮」。
+
+        只在内存里累加，拖动结束才落盘一行，每帧约 0.05ms。"""
+        st = self.drag_stat
+        if not st or not glass:
+            return
+        st["n"] += 1
+        lm = _quick_luma(glass)
+        if lm < st["lo"]:
+            st["lo"] = lm
+        if lm > st["hi"]:
+            st["hi"] = lm
+        if st["n"] % 4 == 1:
+            st["seq"].append(int(lm))
+
+    def _drag_stat_flush(self):
+        """拖动结束：把这一趟的亮度曲线写一行到 %TEMP%\\snaplite_drag.log。
+
+        为什么把日志留在产品里：拖动发黑是「偶发 + 位置随机」的毛病，不留这一趟
+        的亮度序列，事后只能靠猜。一次拖动只写一行、几毫秒，正常使用无感；文件
+        超过 200KB 自动重来，不会长到无限。
+
+        读法：`luma=最小值..最大值`，正常一趟里两者相差很小；出现「黑一下」那一趟
+        的最小值会明显塌下去（面板自己发暗时约 15，正常背景 35 左右），`seq` 里
+        每 8 帧一个采样点，能看出塌在第几段。"""
+        st = self.drag_stat
+        self.drag_stat = None
+        if not st or st["n"] < 3:
+            return
+        try:
+            # 不用 tempfile：打包时它被 excludes 掉了（省体积），import 会失败
+            path = os.path.join(os.environ.get("TEMP") or os.curdir,
+                                "snaplite_drag.log")
+            if os.path.exists(path) and os.path.getsize(path) > 200 * 1024:
+                os.remove(path)
+            with open(path, "a", encoding="ascii") as f:
+                f.write("%s n=%d grab=%d luma=%d..%d seq=%s live=%d pad=%d\n"
+                        % (time.strftime("%m-%d %H:%M:%S"), st["n"], st["grab"],
+                           int(st["lo"]), int(st["hi"]),
+                           ",".join(str(v) for v in st["seq"]),
+                           1 if self.drag_live else 0, DRAG_PAD))
+        except Exception as e:
+            dbg("drag stat flush failed: %r" % (e,))
+
     def _end_drag_glass(self):
-        """拖动结束：丢掉缩略图，下次拖动重新抓"""
+        """拖动结束：恢复抓屏属性、丢掉缩略图，并马上要求重抓一张。
+
+        拖动期间背景可能已经变了（视频在放、别的窗口在动），松手后必须重新
+        拍。这里只置标记 + 切活跃档，真正的重抓留给下一拍，避免在鼠标松开
+        这一下多做一次 12.5ms 的活把松开动作拖粘。"""
+        # 拖动期间给窗口设过「抓屏排除自己」，必须在这里恢复（幂等）：
+        # 万一拖动是被截图/录制打断的、没走 _end_main_drag，也不能残留，
+        # 否则别的截图工具从此拍不到主面板。
+        # 先停预取线程、再还属性。反过来的话，线程可能正抓在手上，而属性
+        # 已经清回 0 —— 那一张抓到的就是面板自己。
+        self._drag_stat_flush()
+        self._stop_drag_prefetch()
+        if self.drag_live:
+            self._excl_release("drag")
+            self.drag_live = False
         self.drag_active = False
         self.drag_small = None
         self.drag_small_size = None
+        self.glass_dirty = True
+        self.glass_live_until = time.time() + GLASS_LIVE_HOLD
+        self._set_glass_tick(GLASS_TICK_LIVE)
 
     def _drag_glass_bytes(self, left, top):
         """按窗口将要到达的屏幕位置，从全屏缩略图里裁出对应区域，放大回 W×H
@@ -2288,30 +3204,495 @@ class App:
         永远落后窗口一帧 —— 拖得越快错位越明显，看着就是背景追不上手。
         自己接管拖动、位置和内容一起交给 UpdateLayeredWindow，就不存在错位。
 
+        取背景有两条路：
+        - 新系统（Win10 2004+）：**现场抓目标位置背后那块桌面**。窗口还没搬
+          到那里，所以那一块天然不含自己，抓到的就是真正的背景 —— 全分辨率，
+          不会像缩略图那样放大 13 倍出锯齿，也没有「补掉自己」留下的横向渐变。
+        - 老系统：退回按下瞬间那张整屏缩略图（`_drag_glass_bytes`），否则抓屏
+          会把自己抓进去。
+
         返回 True 表示这一帧画了。"""
-        if not (self.drag_active and self.drag_small and self.hwnd_main):
+        if not (self.main_drag and self.hwnd_main):
+            return False
+        if not self.drag_live and not (self.drag_active and self.drag_small):
             return False
         pos = (left, top)
         if pos == self.drag_last_pos:
             return False
+
+        if self.drag_live:
+            # 先告诉预取线程「我要去哪儿」，它按这个位置取景。本帧用的是它
+            # **上一轮**抓好的快照：快照在运动方向上多留一截、一轮约 12ms，
+            # 正常拖动都盖得住，所以这一帧不用等它。
+            #
+            # 顺手把「这一帧走了多远」记下来：后台按它把余量往运动方向拉长
+            # （见 _drag_pads）。位移是相对上次**成功提交**的位置算的，所以丢帧
+            # 期间会自然累积成更大的位移，倾斜也更狠 —— 正是需要的反应。
+            prev = self.drag_last_pos
+            if prev is not None:
+                self.drag_step = (left - prev[0], top - prev[1])
+            self.drag_target = pos
+            # 注意这里拿到的**已经是玻璃底**了：模糊在预取线程里对整块做过一次，
+            # 主线程每帧只裁一片（约 0.05ms）。绝不能在这里再模糊一次 —— 那样
+            # 降采样网格会跟着裁切点走，同一段壁纸每帧的条纹位置都在变，就是
+            # 拖动时那层连成片的水波。
+            glass = self._grab_behind(left, top)
+            if glass is None:
+                # 快照没盖住（甩得太快，后台还没跟到）——自己补抓一小块，
+                # 只给这一帧用，不换掉后台那张大图（换了覆盖更小，会连着重抓）。
+                # 首帧没有片子，才顺手存一张大的当起点。
+                #
+                # 这一步要等 DWM 几毫秒，本来是要避免的；但**绝不能**像之前那样
+                # 直接丢帧：丢帧时窗口不动、鼠标位置却一路往前，越丢越远、
+                # 越远越丢，几帧之后就彻底脱手了（实测甩动时 47/50 帧全丢）。
+                # 宁可偶尔卡一下，也必须跟住手。
+                first = self.drag_world is None
+                glass = self._grab_behind_now(
+                    left, top, store=first, pad=DRAG_PAD if first else None)
+            if glass is None:
+                # 补抓也失败（属性没生效 / 抓到自己），这一帧不搬窗口：
+                # 搬过去配上旧玻璃底，背景会在面板里滑出一道水波。
+                return False
+            self.mn_glass = glass
+        else:
+            try:
+                self.mn_glass = self._drag_glass_bytes(left, top)
+            except Exception as e:
+                dbg("drag glass render failed: %r" % (e,))
+                return False
+
         self.drag_last_pos = pos
-        try:
-            self.mn_glass = self._drag_glass_bytes(left, top)
-        except Exception as e:
-            dbg("drag glass render failed: %r" % (e,))
-            return False
+        self._drag_stat_note(self.mn_glass)
         self._present_main(w.POINT(left, top))
         return True
 
+    def _grab_behind(self, left, top):
+        """取 (left, top) 处面板大小的一层**玻璃底**（已模糊，可直接上屏）。
+
+        只从后台线程维护的那张快照里裁（约 0.05ms）。裁不到（甩得太快、
+        快照还没跟上）才由调用方决定补抓，见 _drag_frame。
+
+        快照存的是「整块桌面模糊一遍之后的结果」，不是原始桌面：模糊只做一次，
+        裁切严格等于平移，同一段壁纸不会因为窗口移动而换了条纹相位。
+
+        调用前提：窗口已经设了 WDA_EXCLUDEFROMCAPTURE，抓屏时抓不到自己。"""
+        if not DRAG_PREFETCH:
+            return self._grab_behind_now(left, top)
+        return self._drag_world_crop(left, top)
+
+    def _drag_world_rect(self, left, top, padx, pady=None, leadx=0, leady=0,
+                         back_x=False, back_y=False):
+        """算出快照该抓哪一块：以窗口位置为基准，后方留 padx/pady、前方再按
+        leadx/leady 多留一截，钳在虚拟屏内，并把左上角对齐到模糊网格。
+
+        `padx/pady` 是**后方**（左上方向）的余量，`pady=None` 时取 padx（对称，
+        首帧补抓和单元测试走这条）；`leadx/leady` 是**前方**额外延伸。
+        窗口往右拖时，前面（右）需要更多余量、后面（左）留一点就够，于是整块
+        长成一条横向的带子 —— 面积不变，但一帧 40px 的快拖能连续裁十几帧不用
+        当场抓屏。正方形余量在垂直方向浪费掉的那一半，就是「快拖抖、慢拖不抖」
+        的来源：余量只有 96px，两三帧就出界，主线程只能同步补抓一次 15~45ms。
+        （按方向分配余量的计算见 `_drag_pads`。）
+
+        `back_x/back_y` 表示「前方在负方向」（往左/往上拖），此时起点要往那边
+        多挪 lead，宽度不变 —— 否则向左拖时那一截会加在身后，白留。
+
+        对齐是**画面平滑的关键**，不是优化。模糊用「缩到 1/BLUR_F 再放回」做，
+        降采样网格是相对这块图的左上角铺的：左上角每挪一像素，网格相对桌面就
+        错一像素，同一段壁纸模糊出来的明暗条纹位置就变一次。拖动时每帧都要重
+        算，条纹于是每帧抖一下 —— 细纹理上就是「连成片的水波」（实测偏差
+        4.4~5.9/255，随偏移量以 BLUR_F 为周期来回摆）。左上角对齐到 BLUR_F 的
+        整数倍后，所有快照的网格都落在屏幕同一套格线上，换快照逐像素一致，
+        裁切也严格等于平移。
+
+        尺寸必须取 BLUR_F 的整数倍，这是**相位一致的前提**：`_blur_bgra` 把宽
+        缩到 `W // BLUR_F`，实际比例是 `W / (W // BLUR_F)`，只有 W 是 13 的整数
+        倍时才精确等于 13。比例一偏，网格间隔就不是 13 而是 13.03/13.3，相位会
+        随尺寸和偏移累积漂移 —— 实测非整数倍时同一块桌面差 1.0~1.3/255，取整后
+        是 0.02~0.07。做到这一点后，**不同尺寸的快照之间也能无缝互换**，补抓才
+        敢只抓一小块（见 DRAG_PAD_SMALL），前后不对称的余量也才敢随速度每轮变。
+
+        还必须钳在虚拟屏内。`grab_screen` 对越界部分会用边缘像素铺满
+        （`_fill_edges`），铺出来是一大片纯色；窗口贴着屏幕边拖时，快照一半在
+        屏外，裁出来的面板就带进去一大块色带 —— 看着就是「界面一会黑一下」。
+        """
+        W, H = self.MW, self.MH
+        if pady is None:
+            pady = padx
+        f = self.BLUR_F
+        vx = user32.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+
+        def _tile(need, limit):
+            """向上取整到 f 的倍数，但不超过屏幕能给的最大 f 倍数"""
+            n = (need + f - 1) // f * f
+            return max(f, min(n, limit // f * f))
+
+        gw = _tile(W + padx * 2 + leadx + f, vw)
+        gh = _tile(H + pady * 2 + leady + f, vh)
+        gx = (left - padx - (leadx if back_x else 0)) // f * f
+        gy = (top - pady - (leady if back_y else 0)) // f * f
+        # 贴边时覆盖优先：对不齐顶多多一次条纹变化，盖不住就直接露黑边了。
+        gx = max(vx, min(gx, vx + vw - gw))
+        gy = max(vy, min(gy, vy + vh - gh))
+        return gx, gy, gw, gh
+
+    def _drag_pads(self, dx, dy):
+        """按这一帧的位移 (dx, dy) 分配余量，返回 (padx, pady, leadx, leady)。
+
+        规则只有两条，都是为了守住同一个面积：
+
+        1. **扇形分配**：位移基本是横向，就把绝大部分余量给横向；斜着拖就按
+           两轴位移比例分。`k` 夹在 0.15~0.85，避免某一个方向被压得太薄 ——
+           手总是斜着抖一点，纵向余量给太少就会立刻出界补抓。夹紧值实测：
+           k=0.85 → 819×247（横向余量 465、纵向 82），k=0.15 → 416×494
+           （横向 114、纵向 324）。两边都留够，面积都还是 20 万上下。
+        2. **前重后轻**：整块往运动方向前方多留 `lead`，后方只留一点。前面那段
+           是「手下一帧要去的地方」，后面那段只用得着一次（裁完就甩在身后）。
+
+        面积由二次方程解出来，使 `(W+TX+f)(H+TY+f) ≈ DRAG_AREA`：面积不变，
+        每轮「抓 + 模糊」的耗时就不变，主线程一帧都不会被拖慢。这一点是上一版
+        加大余量失败的原因 —— 补抓是没了，但模糊变贵、整体发钝。
+        """
+        W, H = self.MW, self.MH
+        f = self.BLUR_F
+        ax, ay = abs(dx), abs(dy)
+        mag = ax + ay
+        if mag < 1e-6:
+            # 没动（刚按下）：给对称余量，等方向出来再说
+            return DRAG_PAD, DRAG_PAD, 0, 0
+        k = ax / mag
+        k = max(0.15, min(0.85, k))
+
+        a = W + f                      # 不含余量时的「长」
+        b = H + f
+        m = (1.0 - k) / k
+        B = m * a + b
+        disc = B * B - 4.0 * m * (a * b - DRAG_AREA)
+        if disc < 0:
+            # 面板比目标面积还大（换了更大的面板/更小的 DRAG_AREA），退对称
+            return DRAG_PAD, DRAG_PAD, 0, 0
+        tx = (-B + disc ** 0.5) / (2.0 * m)
+        ty = m * tx
+
+        # 前向占比：0.5（静止）→ DRAG_LEAN_MAX（单帧位移 ≥ DRAG_LEAN_FULL）
+        lean = min(1.0, mag / DRAG_LEAN_FULL)
+        p = 0.5 + (DRAG_LEAN_MAX - 0.5) * lean
+        padx = tx * (1.0 - p)
+        pady = ty * (1.0 - p)
+        leadx = tx * (2.0 * p - 1.0)
+        leady = ty * (2.0 * p - 1.0)
+        # 前方在左/上时，由 _drag_world_rect 的 back_x/back_y 把起点往那边挪，
+        # 宽度不变、面积不变。这里只负责给出长度。
+        return int(padx), int(pady), int(leadx), int(leady)
+
+    def _grab_behind_now(self, left, top, store=None, pad=None):
+        """现抓一块并当场模糊（主线程同步等 DWM + 几毫秒模糊）。
+
+        只有首帧、甩得太快时补抓、以及老退路（DRAG_PREFETCH=False）会走到这里。
+        它是整条拖动里唯一会让主线程等的地方，所以抓得**尽量小**：只要盖住这一
+        帧（每边多留 DRAG_PAD_SMALL）。抓大块看着保险，实际是把一次 6ms 的卡
+        放大成一次 20ms 的卡 —— 快甩时一帧只走几十像素，用不上那么多余量。
+
+        抓小片不会和后台那片大图错开条纹，因为尺寸和左上角都取 BLUR_F 的倍数，
+        相位只由左上角决定（见 _drag_world_rect）。
+
+        `store` 控制要不要**替换** self.drag_world。补抓一律不换：换了就等于拿
+        一张只有 39 像素余量的片去顶替后台那张 96 像素的，覆盖变小、下一帧立刻
+        又不够，反而把补抓喂成连续补抓（实测 15/60 → 20/60）。首帧没片子时才存。"""
+        W, H = self.MW, self.MH
+        if pad is None:
+            pad = DRAG_PAD_SMALL if DRAG_PREFETCH else self.DRAG_WORLD_PAD
+        if store is None:
+            store = not DRAG_PREFETCH
+        gx, gy, gw, gh = self._drag_world_rect(left, top, pad)
+        if self.drag_stat:
+            self.drag_stat["grab"] += 1     # 这一帧走了同步抓屏（会停顿十几毫秒）
+        if not self._excl_acquire("drag"):
+            return None
+        for attempt in range(2):
+            try:
+                if attempt:
+                    # 第一张就抓到自己，说明属性还没在这一帧生效，等一拍再抓
+                    try:
+                        dwmapi.DwmFlush()
+                    except Exception:
+                        pass
+                raw = grab_screen(gx, gy, gw, gh).raw
+            except Exception as e:
+                dbg("drag grab failed: %r" % (e,))
+                return None
+            if not raw or len(raw) != gw * gh * 4:
+                return None
+            ox, oy = left - gx, top - gy
+            if ox < 0 or oy < 0 or ox + W > gw or oy + H > gh:
+                return None
+            mid = _crop_bgra(raw, gw, ox, oy, W, H)
+            # 判「是不是抓到自己」只看中间那块（窗口就在这附近）：真抓到了
+            # 还拿去模糊，面板会整块发暗闪一下，这一帧宁可丢掉等下一帧。
+            if not self._looks_like_me(mid, W, H):
+                if store:
+                    return self._store_drag_world(raw, gx, gy, gw, gh, ox, oy)
+                # 只给这一帧用：模糊这一小片、裁出来，不碰后台维护的那张大图
+                try:
+                    small = self._blur_bgra(raw, gw, gh)
+                except Exception as e:
+                    dbg("drag patch blur failed: %r" % (e,))
+                    return None
+                if not small or len(small) != gw * gh * 4:
+                    return None
+                return _crop_bgra(small, gw, ox, oy, W, H)
+        return None
+
+    def _store_drag_world(self, raw, gx, gy, gw, gh, ox, oy):
+        """把整块桌面模糊一次存起来，并返回面板位置处那一块（已经是玻璃底）。
+
+        模糊必须作用在**整块**上，不能先裁面板大小的块再模糊：后者每一帧的降
+        采样网格都相对当帧的裁切点铺，于是同一段壁纸每帧模糊出来的条纹位置都
+        在变，细纹理上就是一层连成片的水波。整块模糊一次之后，片内每一帧都只
+        是纯裁切，内容严格等于平移，条纹自然不动了。
+
+        代价是这一次要多花几毫秒（532×340 约 5.8ms），所以只在「抓新片」时付，
+        每帧不再付；预取线程里付，主线程一帧都感觉不到。"""
+        try:
+            glass_big = self._blur_bgra(raw, gw, gh)
+        except Exception as e:
+            dbg("drag big blur failed: %r" % (e,))
+            return None
+        if not glass_big or len(glass_big) != gw * gh * 4:
+            return None
+        # 整块元组赋值是原子的：主线程要么读到旧片、要么读到新片，不会读到
+        # 「坐标是新的、像素是旧的」这种撕裂状态。
+        self.drag_world = (gx, gy, gw, gh, glass_big)
+        return _crop_bgra(glass_big, gw, ox, oy, self.MW, self.MH)
+
+    # ---------- 拖动取背景：后台预取线程 ----------
+    def _start_drag_prefetch(self):
+        """拖动开始：让后台线程一直抓「窗口周围一大块」，返回是否接手。
+
+        整个拖动期间后台只做「抓一块大图 → 整块模糊一次 → 原子换掉
+        self.drag_world」，窗口和 UpdateLayeredWindow 仍然只有主线程碰。
+
+        流水线模式（DRAG_PIPELINE）下这一步是两条线程：一条只抓、一条只模糊，
+        靠 self.drag_raw + self.drag_wake 交接。串行做这两件事时一轮 12ms，
+        覆盖率卡在 8 像素/毫秒，快甩就跟不上、逼出主线程补抓（一次十几毫秒，
+        那一下就是「抖」）；并行后一轮约 6ms，能力翻倍。"""
+        if not DRAG_PREFETCH:
+            return False
+        if self.drag_thread is not None and self.drag_thread.is_alive():
+            return True
+        self.drag_stop = threading.Event()
+        if DRAG_PIPELINE:
+            self.drag_raw = None
+            self.drag_wake = threading.Event()
+            self.drag_thread = threading.Thread(
+                target=self._drag_grab_loop, args=(self.drag_stop, self.drag_wake),
+                name="drag-grab", daemon=True)
+            self.drag_thread2 = threading.Thread(
+                target=self._drag_blur_loop, args=(self.drag_stop, self.drag_wake),
+                name="drag-blur", daemon=True)
+            self.drag_thread.start()
+            self.drag_thread2.start()
+            return True
+        self.drag_thread = threading.Thread(
+            target=self._drag_prefetch_loop, args=(self.drag_stop,),
+            name="drag-prefetch", daemon=True)
+        self.drag_thread.start()
+        return True
+
+    def _stop_drag_prefetch(self, wait=0.5):
+        """叫停预取线程并等它们退出（松手、退出程序时用）"""
+        stop = self.drag_stop
+        if stop:
+            stop.set()
+        me = threading.current_thread()
+        for th in (self.drag_thread, self.drag_thread2):
+            if th and th.is_alive() and th is not me:
+                th.join(wait)
+        self.drag_thread = None
+        self.drag_thread2 = None
+        self.drag_stop = None
+        self.drag_wake = None
+        self.drag_raw = None
+        self.drag_world = None
+        self.drag_target = None
+        self.drag_step = (0, 0)
+
+    def _drag_aim(self, left, top):
+        """按当前运动方向算出这一轮该抓哪块、窗口在块里的偏移。
+
+        返回 (gx, gy, gw, gh, ox, oy)；这块盖不住窗口时返回 None（贴到屏幕外
+        或者屏幕比快照还小）。
+
+        余量形状每轮跟着 `drag_step` 变，但宽高和左上角始终是 BLUR_F 的整数倍，
+        所以不同形状的快照之间逐像素对齐、可以随便换（见 _drag_world_rect）。"""
+        dx, dy = self.drag_step
+        padx, pady, leadx, leady = self._drag_pads(dx, dy)
+        gx, gy, gw, gh = self._drag_world_rect(
+            left, top, padx, pady, leadx, leady, dx < 0, dy < 0)
+        W, H = self.MW, self.MH
+        ox, oy = left - gx, top - gy
+        # 钳过屏之后窗口不一定还在这块里（窗口一半滑出屏幕时）：盖不住就别
+        # 存，否则裁出来的是「隔壁的内容」，面板上会出现一块和位置对不上的
+        # 画面 —— 比露黑边更难查。
+        if ox < 0 or oy < 0 or ox + W > gw or oy + H > gh:
+            return None
+        return gx, gy, gw, gh, ox, oy
+
+    def _drag_grab_loop(self, stop, wake):
+        """流水线第一段：只抓，不模糊。
+
+        抓这一下 6~25ms 几乎全在等 DWM 交出桌面表面（CPU 时间接近 0），把模糊
+        挪到另一条线程之后，这段等待就和模糊重叠了 —— 一轮从 12ms 降到 6ms，
+        覆盖能力（pad / 轮时长）随之翻倍。
+
+        故意不 sleep：Windows 休眠最小粒度 15.6ms，随手 sleep(0.001) 实际会睡
+        15.6ms，抓取频率掉到 28 次/秒（实测踩过这个坑）。
+        故意不 DwmFlush：等消隐再抓反而更慢（四组对照验过，别再试）。
+        """
+        _lower_this_thread()
+        seq = 0
+        while not stop.is_set():
+            if not self.main_drag or not self.drag_live:
+                break
+            tgt = self.drag_target
+            if tgt is None:
+                stop.wait(0.002)
+                continue
+            left, top = tgt
+            # 每次按当前位置和当前运动方向重算抓取矩形（会随窗口移动、按方向
+            # 拉长余量、并且钳在屏内）
+            aim = self._drag_aim(left, top)
+            if aim is None:
+                # 窗口贴到屏幕外了，这块盖不全它，抓了也裁不出正确画面
+                stop.wait(0.005)
+                continue
+            gx, gy, gw, gh, ox, oy = aim
+            try:
+                raw = grab_screen(gx, gy, gw, gh).raw
+            except Exception as e:
+                dbg("drag grab failed: %r" % (e,))
+                stop.wait(0.005)
+                continue
+            if not raw or len(raw) != gw * gh * 4:
+                stop.wait(0.005)
+                continue
+            seq += 1
+            # 整块元组赋值是原子的：模糊线程要么读到旧块、要么读到新块，
+            # 不会读到「坐标是新的、像素是旧的」这种撕裂状态。
+            self.drag_raw = (seq, gx, gy, gw, gh, raw, ox, oy)
+            wake.set()
+        if self.drag_thread is threading.current_thread():
+            self.drag_thread = None
+
+    def _drag_blur_loop(self, stop, wake):
+        """流水线第二段：把抓来的整块模糊一次，原子换掉 self.drag_world。
+
+        模糊必须作用在**整块**上，不能先裁面板大小的块再模糊：后者每帧的降采样
+        网格都相对当帧裁切点铺，同一段壁纸每帧模糊出来的条纹位置都在变，细纹理
+        上就是一层连成片的水波。整块模糊一次之后，片内每帧只是纯裁切，内容严格
+        等于平移，条纹自然不动。
+
+        落后就跳过中间块、只模糊最新的那块：旧块就算模糊完也已经盖不住窗口了，
+        白花几毫秒反而拖慢覆盖。
+        """
+        _lower_this_thread()
+        W, H = self.MW, self.MH
+        last = 0
+        while not stop.is_set():
+            r = self.drag_raw
+            if r is not None and r[0] != last:
+                last = r[0]
+                _seq, gx, gy, gw, gh, raw, ox, oy = r
+                try:
+                    mid = _crop_bgra(raw, gw, ox, oy, W, H)
+                    # 属性万一没生效就会抓到自己：这种块存进去，面板会整块发暗
+                    # （就是「界面自己黑一下」）。丢掉，等下一块。
+                    if not self._looks_like_me(mid, W, H):
+                        self._store_drag_world(raw, gx, gy, gw, gh, ox, oy)
+                except Exception as e:
+                    dbg("drag blur failed: %r" % (e,))
+                continue
+            wake.wait(0.02)
+            wake.clear()
+        if self.drag_thread2 is threading.current_thread():
+            self.drag_thread2 = None
+
+    def _drag_prefetch_loop(self, stop):
+        """后台线程：抓一整块 → 模糊一整块 → 原子换掉快照，然后立刻再来一轮。
+
+        模糊放在这里而不是主线程，是这一版最重要的分工：主线程每帧只裁一片
+        （0.05ms），拿到的内容严格等于「同一张模糊图平移」，不会因为窗口位置
+        变了就换了条纹相位。
+
+        故意不 sleep：Windows 的休眠最小粒度是 15.6ms，随手写个 time.sleep(0.001)
+        实际会睡 15.6ms，抓取频率掉到 28 次/秒（实测），跟不上手 —— 那是这条
+        路最容易踩的坑。抓一次 6ms + 模糊 5.8ms，天然就是约 85 次/秒。
+
+        故意不 DwmFlush：等消隐再抓反而更慢（这个结论在 _glass_live_loop 里
+        用四组对照验过，别再试）。"""
+        _lower_this_thread()
+        W, H = self.MW, self.MH
+        while not stop.is_set():
+            if not self.main_drag or not self.drag_live:
+                break
+            tgt = self.drag_target
+            if tgt is None:
+                stop.wait(0.002)
+                continue
+            left, top = tgt
+            # 每次按当前位置和运动方向重算抓取矩形：窗口贴着屏幕边时快照要
+            # 整块平移进屏，不能让它越界去触发补边。
+            aim = self._drag_aim(left, top)
+            if aim is None:
+                # 窗口贴到屏幕外了，这张快照盖不全它，存了也裁不出正确画面
+                stop.wait(0.005)
+                continue
+            gx, gy, gw, gh, ox, oy = aim
+            try:
+                raw = grab_screen(gx, gy, gw, gh).raw
+            except Exception as e:
+                dbg("drag prefetch failed: %r" % (e,))
+                stop.wait(0.005)
+                continue
+            if not raw or len(raw) != gw * gh * 4:
+                stop.wait(0.005)
+                continue
+            mid = _crop_bgra(raw, gw, ox, oy, W, H)
+            # 属性万一没生效就会抓到自己：这种快照不能存，存了面板会整块发暗。
+            # 丢掉这一轮，下一轮再试（属性是常设的，正常不会走到这里）。
+            if self._looks_like_me(mid, W, H):
+                stop.wait(0.005)
+                continue
+            # 模糊在这里做（整块，约 5.8ms），不在主线程做。主线程每帧只裁一片，
+            # 内容严格等于「同一张模糊图平移」，条纹不会随位置抖。
+            self._store_drag_world(raw, gx, gy, gw, gh, ox, oy)
+        if self.drag_thread is threading.current_thread():
+            self.drag_thread = None
+
+
+    def _drag_world_crop(self, left, top):
+        """快照能盖住 (left, top) 就裁一片玻璃底，盖不住返回 None。
+
+        快照里存的是「整块模糊后的图」，所以这里裁出来直接就能上屏，主线程
+        一帧连模糊都不用做。"""
+        wd = self.drag_world
+        if not wd:
+            return None
+        wx, wy, ww, wh, wb = wd
+        W, H = self.MW, self.MH
+        ox, oy = left - wx, top - wy
+        if ox < 0 or oy < 0 or ox + W > ww or oy + H > wh:
+            return None
+        return _crop_bgra(wb, ww, ox, oy, W, H)
+
     # ---------- 自己接管的窗口拖动 ----------
     def _start_main_drag(self):
-        """按下空白处：记下抓手，趁窗口还在原位把整屏缩略出来。
+        """按下空白处：记下抓手，并决定这一趟拖动走哪条取背景的路。
 
-        抓屏放在「按下」这一下、而不是等第一次移动之后：这时窗口还没动过，
-        缩略图里自己的位置是准的；而且用户按下后一般要过一会儿才开始移动，
-        这 40ms 就落在空档里，拖起来不会顿在第一帧。
-        （试过推迟到移动时再抓，点一下确实省了 40ms，但拖动第一帧要等抓屏，
-        会丢掉一个像素的位移 —— 拖动手感比「点一下多花 40ms」重要。）
+        新系统走「实时抓目标位置」：按下不再需要 40ms 抓整屏，点一下反而更轻。
+        老系统没有「抓屏排除自己」，只能沿用按下瞬间的整屏缩略图。
 
         不用 ReleaseCapture + WM_NCLBUTTONDOWN 交给系统拖，是因为那样窗口
         位置由系统改、背景由我们补，两件事不在同一帧里 —— 见 _drag_frame。"""
@@ -2321,12 +3702,41 @@ class App:
         user32.GetWindowRect(self.hwnd_main, byref(rc))
         p = w.POINT()
         user32.GetCursorPos(byref(p))
-        self._begin_drag_glass()
-        if not self.drag_active:
-            # 抓不到整屏就别拖了：硬拖会得到一个没有背景的空白窗口
-            return
+
+        # 拖动要独占「抓屏排除自己」这个属性：线程退休时会把属性清回 0，
+        # 正好把拖动刚设上的 0x11 抹掉，于是拖到旧位置会抓到自己。
+        # 干脆先把它停掉，松手后 _end_drag_glass 置脏 + 切活跃档，它会重启。
+        self._stop_glass_live()
+
+        self.drag_live = self._excl_acquire("drag")
+        if self.drag_live:
+            # 只在拖动这一小段时间排除自己，松手立刻恢复 —— 否则别的截图工具
+            # 拍不到主面板
+            try:
+                # 等这一帧真的把它摘掉再开始抓，否则第一帧会抓到自己，
+                # 看着像「面板里又套了一个面板」。等的就是下一个垂直消隐，
+                # 实测 3~6ms —— 比旧方案按下时抓整屏那 40ms 便宜得多。
+                dwmapi.DwmFlush()
+            except Exception:
+                pass
+        else:
+            self._begin_drag_glass()
+            if not self.drag_active:
+                # 抓不到整屏就别拖了：硬拖会得到一个没有背景的空白窗口
+                return
         self.main_drag = True
+        self.drag_last_pos = None
+        self.drag_world = None          # 每次拖动重新抓，别用上一趟的旧快照
+        self._drag_stat_begin()
+        self.drag_target = (rc.left, rc.top)
+        self.drag_step = (0, 0)         # 还没动，先给对称余量
         self.main_drag_off = (p.x - rc.left, p.y - rc.top)
+        if self.drag_live:
+            # 先在按下这一刻同步抓一张打底，然后交给后台线程续。打底这张要
+            # 6~13ms，但花在「刚按下、手还没动」的时候，感觉不到；有它兜着，
+            # 拖动第一帧就有背景，不会开局空一下。
+            self._grab_behind_now(rc.left, rc.top)
+            self._start_drag_prefetch()
         user32.SetCapture(self.hwnd_main)
 
     def _move_main_drag(self):
@@ -2339,7 +3749,7 @@ class App:
                          p.y - self.main_drag_off[1])
 
     def _end_main_drag(self):
-        """结束拖动：放掉鼠标捕获、清掉缩略图"""
+        """结束拖动：放掉鼠标捕获，收尾统一交给 _end_drag_glass"""
         if not self.main_drag:
             return
         self.main_drag = False
@@ -2347,28 +3757,56 @@ class App:
         self._end_drag_glass()
 
     def _corner_cov(self, R):
-        """圆角像素覆盖率（3×3 超采样），结果缓存，只算一次"""
+        """圆角像素覆盖率（按面积积分），结果缓存，只算一次。
+
+        以前是 3×3 超采样，覆盖率只能取到 9 个值（0/28/57/85/113/142/170/
+        227/255）。而圆角弧线上相邻像素的真实覆盖率是连续变化的，卡在这几档
+        之间跳，角上就是一段亮一段暗的台阶 —— 面板边框那条 1px 高光因此显得
+        「不均匀、有锯齿」。
+
+        现在把像素沿 y 方向切 16 份，每份用圆弧在该高度的**精确水平弦长**求
+        覆盖宽度再累加：x 方向是解析解，y 方向 16 等分。和 64×64 超采样真值
+        比，最大偏差 16/255 → 2/255，平均 0.70 → 0.02，取值从 9 档变成 22 档
+        且单调。
+
+        只算一次（R 变了才重算）：R=20 时 5.9ms，R=40（200% 缩放）时 18.6ms，
+        不会进每帧的热路径。
+        """
         if self.mn_cov and self.mn_cov_key == R:
             return self.mn_cov
+        SUB = 16
         cov = []
         for yy in range(R):
             row = []
             for xx in range(R):
-                hit = 0
-                for sy in range(3):
-                    for sx in range(3):
-                        dx = R - (xx + (sx + 0.5) / 3.0)
-                        dy = R - (yy + (sy + 0.5) / 3.0)
-                        if dx * dx + dy * dy <= R * R:
-                            hit += 1
-                row.append(int(round(hit * 255.0 / 9.0)))
+                total = 0.0
+                for s in range(SUB):
+                    y = yy + (s + 0.5) / SUB
+                    dy = R - y
+                    if dy <= -R or dy >= R:
+                        continue
+                    w = sqrt(R * R - dy * dy)
+                    lo = xx if xx > R - w else R - w
+                    hi = (xx + 1) if (xx + 1) < (R + w) else (R + w)
+                    if hi > lo:
+                        total += (hi - lo) / SUB
+                if total <= 0.0:
+                    row.append(0)
+                elif total >= 1.0:
+                    row.append(255)
+                else:
+                    row.append(int(round(total * 255.0)))
             cov.append(row)
         self.mn_cov, self.mn_cov_key = cov, R
         return cov
 
     def _apply_round_mask(self, W, H):
         """把四角按圆角覆盖率削掉（含抗锯齿）。只处理 4 个角，
-        直边本来就是不透明的，没必要每帧扫全图。"""
+        直边本来就是不透明的，没必要每帧扫全图。
+
+        用 bytearray 算：整块拷一份 200KB 只要 0.02ms，真正贵的是逐像素
+        那个循环，所以换成 ctypes 数组「就地改」反而更慢（下标访问要过类型
+        转换），实测 0.29ms → 0.34ms，不划算。"""
         R = int(round(self.RADIUS))
         R = max(2, min(R, min(W, H) // 2))
         cov = self._corner_cov(R)
@@ -2407,18 +3845,40 @@ class App:
                      W - self.px(2), self.px(1.6), max(1.0, R - 1))
         g.stroke_round(0x59FFFFFF, 1, 0.5, 0.5, W - 1, H - 1, R)
 
-        close, hide, btn, hot = self._main_layout()
+        close, pin, hide, btn, hot = self._main_layout()
 
-        # 标题
+        # 标题 + 版本号。版本号紧跟在 "SnapLite" 后面，与标题同一个框、同样居中
+        # —— 标题宽度按实际字体量出来（DPI 或字体变了会自己跟上），不写死偏移。
+        # 注意绘制用的 px(120) 是个宽松的布局框（远大于字形），命中判断用的是
+        # _title_rect 量出来的字形框，两者别混。
         g.text(APP_NAME, self.px(19), C_TITLE, self.px(19), self.px(10),
                self.px(120), self.px(28), 0, True)
-        tag_x = self.px(126)
-        g.fill_round(C_TAG_BG, tag_x, self.px(15), self.px(68), self.px(20), self.px(10))
-        g.text("轻量截图", self.px(11), C_SUB, tag_x, self.px(15),
-               self.px(68), self.px(20), 1)
-        # 版本号
-        g.text("v" + APP_VERSION, self.px(10.5), C_HINT, tag_x + self.px(76),
-               self.px(15), self.px(72), self.px(20), 0)
+        trect = self._title_rect(g) or (self.px(19), self.px(10), 0, 0)
+        g.text("v" + APP_VERSION, self.px(10.5), C_HINT,
+               trect[0] + trect[2] + self.px(7), self.px(10),
+               self.px(56), self.px(28), 0)
+
+        # 图钉（置顶开关）：开着时图标常亮 + 一层浅底，关着跟 — ✕ 一样是灰的。
+        # 用「亮不亮」而不是换图标来表达状态，26px 里改形状反而看不清。
+        #
+        # 造型是「↑ 顶到一条横线」，不是图钉剪影：26px 里画图钉，帽+斜腰+针
+        # 三条线挤在一起会糊成一个漏斗（实测过，见 tools/preview_pin_icons.py），
+        # 而箭头只有一条竖线和两撇，任何尺寸下都不会看错。
+        hot_pin = (self.hover_main == "pin")
+        if hot_pin:
+            g.fill_round(C_HOVER_SOFT, pin[0], pin[1], pin[2], pin[3], self.px(7))
+        elif self.topmost:
+            g.fill_round(C_TAG_BG, pin[0], pin[1], pin[2], pin[3], self.px(7))
+        pc = C_WHITE if (hot_pin or self.topmost) else C_SUB
+        pcx, pcy = pin[0] + pin[2] / 2, pin[1] + pin[3] / 2
+        pw_ = max(1.2, self.px(1.4))
+        g.line(pc, pw_, pcx - self.px(4.6), pcy - self.px(5.8),
+               pcx + self.px(4.6), pcy - self.px(5.8))
+        g.line(pc, pw_, pcx, pcy + self.px(5.8), pcx, pcy - self.px(1.8))
+        g.line(pc, pw_, pcx - self.px(3.2), pcy + self.px(0.4),
+               pcx, pcy - self.px(3.6))
+        g.line(pc, pw_, pcx + self.px(3.2), pcy + self.px(0.4),
+               pcx, pcy - self.px(3.6))
 
         # — 收进托盘
         hot_hide = (self.hover_main == "hide")
@@ -2490,6 +3950,14 @@ class App:
         以前这里是 97 行、34 个分支的 if 链：想改「点 ✕ 干什么」得先通读全文。
         现在按输入类别拆成 5 个方法（键 / 移动 / 离开 / 按下 / 抬起 / 丢捕获），
         和 _on_overlay 同一个套路 —— 一次交互 = 一个方法。"""
+        if self.wm_taskbar_created and msg == self.wm_taskbar_created:
+            # explorer 重启了：任务栏那格是它的内存，图标要重新挂一次
+            self._recreate_tray()
+            return 0
+        if msg == WM_DISPLAYCHANGE:
+            # 分辨率 / 显示器插拔 / 缩放变了：面板可能被留在屏幕外
+            self._on_display_change()
+            return 0
         if msg == WM_PAINT:
             self._paint_main(hwnd)
             return 0
@@ -2505,6 +3973,14 @@ class App:
         if msg == WM_TIMER:
             if wp == TIMER_GLASS:
                 self._tick_glass()
+            return 0
+        if msg == WM_GLASS_FRAME:
+            if wp == 1:
+                # 线程收工：定时器回到低频探测，下次桌面再变由它叫醒线程
+                self.glass_thread = None
+                self._set_glass_tick(GLASS_TICK_IDLE)
+            else:
+                self._glass_frame_ready()
             return 0
         if msg in (WM_KEYDOWN, WM_SYSKEYDOWN):
             if self._main_key(wp):
@@ -2522,6 +3998,10 @@ class App:
         if msg == WM_LBUTTONDOWN:
             self._main_click(hwnd, lp)
             return 0
+        if msg == WM_RBUTTONUP:
+            # 主面板右键 = 托盘那份菜单，但只认「SnapLite」logo 那一块
+            self._panel_menu(lp)
+            return 0
         if msg == WM_LBUTTONUP:
             if self._main_release():
                 return 0
@@ -2534,10 +4014,12 @@ class App:
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
     def _main_hit(self, x, y):
-        """(x, y) 落在主面板哪个可交互元素上：close / hide / btn / hot / None"""
-        close, hide, btn, hot = self._main_layout()
+        """(x, y) 落在主面板哪个可交互元素上：close / pin / hide / btn / hot / None"""
+        close, pin, hide, btn, hot = self._main_layout()
         if self._in(x, y, close):
             return "close"
+        if self._in(x, y, pin):
+            return "pin"
         if self._in(x, y, hide):
             return "hide"
         if self._in(x, y, btn):
@@ -2579,12 +4061,15 @@ class App:
             user32.InvalidateRect(hwnd, None, False)
 
     def _main_click(self, hwnd, lp):
-        """左键按下：✕/— 收进托盘、热键条开始录制、截图按钮开拍、空白拖动窗口"""
+        """左键按下：✕/— 收进托盘、图钉切置顶、热键条开始录制、截图按钮开拍、空白拖动窗口"""
         x, y = lo(lp), hi(lp)
         where = self._main_hit(x, y)
         if where in ("close", "hide"):
             # ✕ 只收进托盘，不退出；退出走托盘右键菜单
             user32.ShowWindow(hwnd, SW_HIDE)
+            return
+        if where == "pin":
+            self._toggle_topmost()
             return
         if where == "hot":
             if self.recording:
@@ -2600,6 +4085,36 @@ class App:
             return
         # 空白处可拖动窗口（自己接管，位置与背景同帧提交，见 _drag_frame）
         self._start_main_drag()
+
+    def _is_topmost(self):
+        """读窗口的真实置顶状态，而不是信自己记的那个书签。
+
+        `SetWindowPos` 是可能失败的（句柄失效、被 Shell 抢 z-order），失败时
+        `self.topmost` 照样翻转，图钉就会亮着而窗口其实没置顶 —— 用户看到的是
+        「点了没反应」。所以每次点完都回读一次 ex-style，以窗口为准。"""
+        if not self.hwnd_main:
+            return False
+        return bool(user32.GetWindowLongW(self.hwnd_main, GWL_EXSTYLE)
+                    & WS_EX_TOPMOST)
+
+    def _toggle_topmost(self):
+        """切换「总在最前」。
+
+        用 SetWindowPos 换 z-order，而不是重设 WS_EX_TOPMOST 样式：改样式要走
+        SetWindowLong + SetWindowPos(FRAMECHANGED)，分层窗口重排会闪一帧空窗。
+        SWP_NOACTIVATE 让焦点留在原处，点按钮不会把面板强行提到前台。"""
+        if not self.hwnd_main:
+            return
+        want = not self.topmost
+        ins = w.HWND(HWND_TOPMOST if want else HWND_NOTOPMOST)
+        user32.SetWindowPos(self.hwnd_main, ins, 0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        real = self._is_topmost()
+        if real != want:
+            dbg("topmost: SetWindowPos 没生效（想要 %s，实际 %s）" % (want, real))
+        self.topmost = real            # 以窗口实际状态为准，别让图钉假亮
+        user32.InvalidateRect(self.hwnd_main, None, False)
+        dbg("topmost -> %s" % self.topmost)
 
     def _main_release(self):
         """左键抬起：结束窗口拖动。返回 True = 已处理，False = 放给系统"""
@@ -2617,6 +4132,40 @@ class App:
             return False
         self._end_main_drag()
         return True
+
+    def _title_rect(self, g):
+        """「SnapLite」这几个字形实际占的那一块（不含版本号）。
+
+        宽度按字形量，不写死：换系统字体、调 DPI、改字号都会自己跟上。绘制那
+        边用的 `px(120)` 是个宽松的布局框（远大于字形本身），拿它做命中判断会
+        让标题右边一大片空白也能右键出菜单 —— 这就是为什么要单独量一次。
+
+        量不出来（画布句柄无效时 measure 会给 0）就返回 None，调用方按「不中」
+        处理：宁可右键没反应，也不要在整块面板上乱弹。"""
+        try:
+            tw, th = g.measure(APP_NAME, self.px(19), True)
+        except Exception:
+            return None
+        if tw < self.px(10):
+            return None
+        # +1：measure 给的是浮点，截断后少半像素就可能漏掉最后一个字母的右缘
+        return (self.px(19), self.px(10), int(tw) + 1, int(th) + 1)
+
+    def _in_title(self, x, y):
+        """(x, y) 是否点在「SnapLite」logo 上 —— 主面板只有这里右键才弹菜单。
+
+        往外放一圈 px(6)：严格卡在字形边界上的话，点在字的边缘会觉得「明明
+        点到了却没反应」；但也不放到整条标题栏，右边还有版本号和三个按钮。"""
+        try:
+            with GFX(self.mn_dc) as g:
+                rect = self._title_rect(g)
+        except Exception:
+            return False
+        if rect is None:
+            return False
+        tx, ty, tw, th = rect
+        pad = self.px(6)
+        return (tx - pad <= x < tx + tw + pad) and (ty - pad <= y < ty + th + pad)
 
     def _in(self, x, y, rect):
         """点是否落在矩形内。矩形是 (x, y, w, h) 这种四元组"""
@@ -2643,6 +4192,9 @@ class App:
         # 拖动中途被热键打断时，鼠标捕获还挂在主窗口上 —— 不先收尾的话，
         # 遮罩收不到鼠标（框选失效），主界面还会继续跟着光标跑。
         self._end_main_drag()
+        # 截图要独占抓屏：线程还在抓的话，两边都会把自己标成「抓屏排除」
+        # 再各自恢复，遮罩和缩略图都可能拍不到面板。先把它停干净再开工。
+        self._stop_glass_live()
         self.capturing = True
         try:
             self._begin_capture()
@@ -4821,6 +6373,14 @@ class App:
     def create_tray(self):
         """把图标放进系统托盘（右键菜单、悬停提示都靠它）"""
         self.hicon = self._make_icon()
+        self._add_tray_icon()
+
+    def _add_tray_icon(self):
+        """往任务栏挂一次图标。
+
+        单独拆出来是因为 explorer 重启后要再挂一次：图标（HICON）在进程里一直
+        活着，但任务栏那一格是 explorer 自己的内存，它一重启就全没了。只重建
+        图标（create_tray）会把 HICON 漏掉一个，所以重挂走这里。"""
         nid = self.tray
         nid.cbSize = sizeof(NOTIFYICONDATAW)
         nid.hWnd = self.hwnd_main
@@ -4830,6 +6390,19 @@ class App:
         nid.hIcon = self.hicon
         nid.szTip = APP_TITLE + " · 截图  " + self._hotkey_label()
         shell32.Shell_NotifyIconW(0, byref(nid))
+
+    def _recreate_tray(self):
+        """explorer 重启了：把托盘图标重新挂上去。
+
+        不重挂的后果是图标永久消失 —— 程序还在跑、热键还能用，但用户从任务栏
+        找不到入口，只能去任务管理器结束它。"""
+        try:
+            if not self.hicon:
+                self.hicon = self._make_icon()
+            self._add_tray_icon()
+            dbg("taskbar recreated, tray icon re-added")
+        except Exception as e:
+            dbg("re-add tray icon failed: %r" % (e,))
 
     def _update_tray_tip(self):
         """刷新托盘的悬停提示，把当前快捷键显示出来"""
@@ -4865,22 +6438,74 @@ class App:
 
     def _tray_menu(self):
         """弹托盘右键菜单：改快捷键 / 开机启动 / 退出"""
+        cmd = self._menu_popup(True)
+        if cmd:
+            self._menu_command(cmd)
+
+    def _panel_menu(self, lp):
+        """主面板上右键：**只有点在「SnapLite」logo 上**才弹菜单。
+
+        别的地方（空白、按钮、热键条）一律不响应 —— 整块面板都能弹的话，想拖
+        一下窗口或者随手误触右键就会蹦出菜单。
+
+        菜单跟托盘同一份，只是不挂「显示主界面」：面板本来就在眼前，那条点了
+        也只会把焦点挪一下，留着反而让人以为面板被藏起来了。Command ID 是固定
+        编号，少挂一条不会让下面的错位。
+
+        弹之前先停活跃线程、弹完标脏：菜单是弹在鼠标位置的系统窗口，正好压在
+        面板上，菜单期间抓屏会把菜单自己拍进玻璃底，菜单一关就露出半截影子。"""
+        x, y = lo(lp), hi(lp)
+        if not self._in_title(x, y):
+            return
+        if self.main_drag:
+            # 左键按住拖窗口时又点了右键：这时候弹菜单，拖动循环会卡在中间
+            return
+        if self.recording:
+            self._end_record()          # 录制中右键 = 放弃这次录制，然后照常弹
+        self._stop_glass_live()
+        self.menu_open = True
+        if self.hover_main is not None:
+            # 菜单弹出来后鼠标可能已经不在面板上了，高亮会一直挂着
+            self.hover_main = None
+            user32.InvalidateRect(self.hwnd_main, None, False)
+        try:
+            cmd = self._menu_popup(False)
+        finally:
+            self.menu_open = False
+            self.glass_dirty = True     # 菜单盖了这一阵，桌面可能早变了
+        if cmd:
+            self._menu_command(cmd)
+
+    def _menu_popup(self, include_show):
+        """建并跟踪右键菜单，返回用户点了哪一项（0 = 点别处 / 没选）。
+
+        托盘图标和主面板共用这一份，两处唯一的差别就是要不要「显示主界面」。"""
         pt = w.POINT()
         user32.GetCursorPos(byref(pt))
         hm = user32.CreatePopupMenu()
         user32.AppendMenuW(hm, 0x0, 1, "截图\t" + self._hotkey_label())
-        user32.AppendMenuW(hm, 0x0, 2, "显示主界面")
+        if include_show:
+            user32.AppendMenuW(hm, 0x0, 2, "显示主界面")
         user32.AppendMenuW(hm, 0x800, 0, None)
         user32.AppendMenuW(hm, 0x0, 5, "更改快捷键…")
         checked = self.autostart_enabled()
         user32.AppendMenuW(hm, 0x8 if checked else 0x0, 4, "开机自动启动")
         user32.AppendMenuW(hm, 0x800, 0, None)
         user32.AppendMenuW(hm, 0x0, 3, "退出 SnapLite")
+        # 不先抢前台的话，点菜单外面它不会自己收起来（TrackPopupMenu 的老规矩）
         user32.SetForegroundWindow(self.hwnd_main)
-        cmd = user32.TrackPopupMenu(hm, 0x0100 | 0x0080 | 0x0004 | 0x0008,
-                                    pt.x, pt.y, 0, self.hwnd_main, None)
-        user32.PostMessageW(self.hwnd_main, WM_NULL, 0, 0)
-        user32.DestroyMenu(hm)
+        try:
+            return user32.TrackPopupMenu(hm, 0x0100 | 0x0080 | 0x0004 | 0x0008,
+                                         pt.x, pt.y, 0, self.hwnd_main, None)
+        finally:
+            # 放在 finally 里：万一上面抛异常，菜单句柄也不能漏（每弹一次漏一个
+            # HMENU，攒久了 GDI 句柄会耗尽）。PostMessage(WM_NULL) 是老规矩，
+            # 让菜单关掉之后键盘焦点能正常回到自己的窗口。
+            user32.PostMessageW(self.hwnd_main, WM_NULL, 0, 0)
+            user32.DestroyMenu(hm)
+
+    def _menu_command(self, cmd):
+        """菜单选中之后的动作，托盘和主面板走的都是这一份"""
         if cmd == 1:
             self.start_capture()
         elif cmd == 2:
@@ -4888,7 +6513,7 @@ class App:
         elif cmd == 3:
             self.quit()
         elif cmd == 4:
-            self.set_autostart(not checked)
+            self.set_autostart(not self.autostart_enabled())
         elif cmd == 5:
             self._show_panel()
             self._begin_record()
@@ -4940,6 +6565,17 @@ class App:
 
     def quit(self):
         """退出：注销热键、移除托盘图标、卸钩子、释放全部缓冲"""
+        # 先把活跃档线程收掉，否则它可能正在用马上要释放的缓冲和窗口
+        try:
+            self._stop_glass_live()
+        except Exception:
+            pass
+        try:
+            self._stop_drag_prefetch()
+        except Exception:
+            pass
+        # 不管属性现在挂在谁名下，退出前一律清掉
+        self._excl_reset()
         try:
             shell32.Shell_NotifyIconW(2, byref(self.tray))
         except Exception:
@@ -4992,7 +6628,11 @@ class App:
 
 
 def main():
-    """程序入口。单实例检查：已经有一个在跑就直接把它的窗口叫到前面"""
+    """程序入口。单实例检查：已经有一个在跑就直接把它的窗口叫到前面。
+
+    检查分两道：先抢命名互斥（原子，没有竞态），再找窗口（兼容没有互斥的旧版本）。
+    只靠找窗口是不够的 —— onefile 启动要先解压 2~3 秒，这段时间窗口根本不存在，
+    两次快速双击都能通过检查，结果就是两个面板叠在一起互相抓屏。"""
     try:
         try:
             if SetProcessDpiAwarenessContext is not None:
@@ -5004,6 +6644,16 @@ def main():
                 user32.SetProcessDPIAware()
             except Exception:
                 pass
+        # 句柄故意不关：它活到进程退出，互斥才一直占着
+        global _instance_mutex
+        _instance_mutex = windll.kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        if _instance_mutex and windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            dbg("another instance holds the mutex")
+            prev = user32.FindWindowW("SnapLiteMain", APP_NAME)
+            if prev:
+                user32.ShowWindow(prev, SW_SHOW)
+                user32.SetForegroundWindow(prev)
+            return
         prev = user32.FindWindowW("SnapLiteMain", APP_NAME)
         dbg("start frozen=%s prev=%s" % (getattr(sys, "frozen", False), prev))
         if prev:
