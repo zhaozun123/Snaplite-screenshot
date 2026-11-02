@@ -12,13 +12,33 @@
 
 ## 下载
 
-最新版本 **v1.4.0**（Windows 单文件绿色版，约 4.6 MB，64 位，双击即用，无需安装 Python）：
+最新版本 **v1.4.1**（Windows 单文件绿色版，约 4.6 MB，64 位，双击即用，无需安装 Python）：
 
-**[⬇ 下载 SnapLite.exe](https://github.com/zhaozun123/Snaplite-screenshot/releases/download/v1.4.0/SnapLite.exe)**
+**[⬇ 下载 SnapLite.exe](https://github.com/zhaozun123/Snaplite-screenshot/releases/download/v1.4.1/SnapLite.exe)**
 
 > 首次运行会在 `%APPDATA%\SnapLite\` 生成配置文件。
 > 退出方式：托盘图标右键 → 退出，或**在面板左上角「SnapLite」字样上右键** → 退出
 > （关窗口只是隐藏到托盘）。
+
+**v1.4.1 更新**：
+
+- **面板偶尔「黑一下又变回来」修好了**：每帧提交前先量一次玻璃底的平均亮度，这一帧
+  几乎全黑、而上一帧正常，就判定为坏帧不提交，并把内部留底的背景一起退回上一帧
+  （否则鼠标一移过去触发重绘，黑底又会被取出来画）。抓到一帧全黑就丢掉，画面保持
+  原样，最多等下一拍跟上
+- **加了黑帧日志**：真拦到时往 `%APPDATA%\SnapLite\snap_glass.log` 写一行，含抓屏回来
+  的 `raw=`（原始亮度）和模糊之后的 `glass=`，一眼就能看出黑是抓屏那一步出的还是模糊
+  那一步出的。平时一个字节都不写
+- **点「开始截图」不再闪一下**：旧流程先把面板提交成全透明再抓屏，面板从 0.1ms 起就
+  没有内容，遮罩要到 183ms 后才出现，中间这段时间屏幕上没有面板。改为抓屏时让系统把
+  面板排除在外（`WDA_EXCLUDEFROMCAPTURE`），**面板一帧都不变**，闪自然消失
+- **顺手把抓屏从两次减到一次**：原来整屏抓取后还要再 BitBlt 一次生成第二张位图，
+  耗时 183ms → 128ms，并省掉一次 37ms 的全屏拷贝
+- **马赛克不再「透过面板」打码**：旧流程有两张图，马赛克从「面板透明的那张」取色，
+  屏幕显示和导出用「补回面板的那张」，两张差的就是面板区域，所以在面板上刷马赛克取到
+  的是面板背后的壁纸。现在只抓一张，取色直接从要显示的那张图回读，两份数据天然一致
+- **截图期间临时撤掉置顶**：不撤的话面板会浮在遮罩之上、那块不跟着选区变暗；取消截图
+  后自动戴回
 
 **v1.4.0 更新**：
 
@@ -148,7 +168,7 @@ python -m PyInstaller SnapLite.spec --noconfirm --clean
 
 ```
 snap.py              主程序（全部功能都在这一个文件里）
-ARCHITECTURE.md      代码结构说明：八段职责、改什么去哪里、二十七个必知坑、自测清单
+ARCHITECTURE.md      代码结构说明：八段职责、改什么去哪里、三十个必知坑、自测清单
 SnapLite.spec        PyInstaller 打包配置
 make_ico.py          生成 app.ico（纯 BMP/AND 掩码，兼容各版本资源管理器）
 app.ico              程序图标
@@ -165,6 +185,7 @@ tests/
   test_glass_follow.py  玻璃底跟随：背景在变时必须换，没变时一帧都不多算
   test_glass_live_thread.py  活跃档后台线程：起停 / 静止收工 / 让路 / 帧不堆积
   test_glass_guard.py       抓屏属性的归属 / 抓到自己不上屏 / 拖动不吃脏帧 / 快照对齐
+  test_capture_flow.py      开始截图不许闪 / 马赛克取色与呈现同源 / 置顶摘戴 / 老系统退路
   test_blur_edge.py         模糊不许吃「图外」：纯灰图模糊后四边必须与中心同亮度
   test_robust.py            托盘重建 / 单实例 / 改分辨率 / 日志上限
   test_overlay_msgs.py  遮罩消息：框选 / 移动 / 改大小 / 标注 / 方向键 / 右键与 Esc 逐级退出
@@ -202,6 +223,7 @@ python tests/test_panel_menu.py       # 主面板右键菜单（只认 logo）
 python tests/test_glass_follow.py     # 玻璃底跟随背景变化
 python tests/test_glass_live_thread.py  # 活跃档线程：起停 / 让路 / 收工
 python tests/test_glass_guard.py        # 抓屏属性归属 / 脏帧不上屏
+python tests/test_capture_flow.py       # 截图流程：不闪 / 马赛克取色同源
 python tests/test_blur_edge.py          # 模糊不许把「图外」当黑
 python tests/test_robust.py             # 托盘重建 / 单实例 / 改分辨率 / 日志上限
 python tools/verify_glass_motion.py   # 真机验证：背景在动时玻璃底跟不跟

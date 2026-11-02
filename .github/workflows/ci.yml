@@ -66,6 +66,9 @@ jobs:
       - name: 主面板交互（hover/点 ✕/拖窗口/按键）
         run: python tests/test_main_panel.py
 
+      - name: 截图流程（不闪 / 马赛克取色同源 / 置顶摘戴 / 老系统退路）
+        run: python tests/test_capture_flow.py
+
       - name: 玻璃底跟随桌面内容变化（背景在有视频/动画时必须跟上）
         run: python tests/test_glass_follow.py
 
