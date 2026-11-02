@@ -55,6 +55,16 @@ app = snap.App()
 app.create_main()
 W, H = app.MW, app.MH
 
+# 屏幕尺寸：拖动余量那几节（6/9）的判据和屏幕大小直接相关。
+# CI 的 windows-latest 只有 1024×768，本机常见 2560×1440。
+#
+# 想在本机复现 CI 的小屏条件：SNAPLITE_TEST_SCREEN=1024x768 python tests/test_glass_guard.py
+# 伪装只在这两节生效（第 6 节安装、第 10 节之前撤掉）—— 前面几节要真的搬窗口，
+# 屏幕被说小了程序会把窗口钳回去，反而测出假失败。
+VW = user32.GetSystemMetrics(snap.SM_CXVIRTUALSCREEN)
+VH = user32.GetSystemMetrics(snap.SM_CYVIRTUALSCREEN)
+print("屏幕 %dx%d，面板 %dx%d" % (VW, VH, W, H))
+
 if not app._can_exclude_from_capture():
     print("这台机器的 Windows 版本不支持「抓屏排除自己」，本测试跳过")
     sys.exit(0)
@@ -224,9 +234,32 @@ snap.grab_screen = grab_self      # 后面几节还要用「抓到自己」的�
 
 # ---------------------------------------------------------------- 6. 后台预取快照
 print("\n=== 6. 拖动取背景：主线程只裁、绝不自己抓 ===")
+# 从这里开始伪装屏幕（如果设了环境变量），到第 10 节之前撤掉
+_real_gsm = None
+_SCR = os.environ.get("SNAPLITE_TEST_SCREEN", "").strip().lower()
+if _SCR:
+    try:
+        _fw, _fh = [int(v) for v in _SCR.split("x")]
+    except Exception:
+        sys.exit("SNAPLITE_TEST_SCREEN 写法应是 1024x768，收到 %r" % _SCR)
+    _real_gsm = user32.GetSystemMetrics
+    _fake = {snap.SM_XVIRTUALSCREEN: 0, snap.SM_YVIRTUALSCREEN: 0,
+             snap.SM_CXVIRTUALSCREEN: _fw, snap.SM_CYVIRTUALSCREEN: _fh}
+
+    def _gsm(idx):
+        return _fake.get(idx, _real_gsm(idx))
+
+    user32.GetSystemMetrics = _gsm
+    VW, VH = _fw, _fh
+    print("（已把虚拟屏伪装成 %dx%d）" % (_fw, _fh))
+
 snap.DRAG_PREFETCH = True
 app.drag_world = None
 calls["n"] = 0
+# 窗口位置按屏幕居中算，别写死 600/400 —— 1024×768 的 CI 上，600+340 已经
+# 贴在屏边上，稍一偏移窗口就出屏，快照必然钳位，测的就不是「对齐」这件事了。
+LEFT = (VW - W) // 2
+TOP = (VH - H) // 2
 
 
 def grab_counted(x, y, ww, hh):
@@ -244,17 +277,17 @@ try:
     app._excl_acquire("drag")
     # 快照还没建起来：必须直接返回 None，绝不能顺手在主线程抓一次。
     # 主线程抓一次要等 DWM 5~28ms，等待时长随机，一次就把帧节奏打乱。
-    got = app._grab_behind(600, 400)
+    got = app._grab_behind(LEFT, TOP)
     check("没快照就返回 None（主线程不抓屏）", got is None, repr(got))
     check("确实一次都没抓", calls["n"] == 0, "%d 次" % calls["n"])
 
     # 首帧补抓（按下那一刻做，手还没动）：走 store 路径存一张大的当起点
-    raw = app._grab_behind_now(600, 400, store=True, pad=snap.DRAG_PAD)
+    raw = app._grab_behind_now(LEFT, TOP, store=True, pad=snap.DRAG_PAD)
     check("补抓回来了正好的面板块", raw is not None and len(raw) == W * H * 4)
     check("补抓建立了快照", app.drag_world is not None)
     pad = snap.DRAG_PAD
     wx, wy, ww, wh, wb = app.drag_world
-    gx0, gy0, gw0, gh0 = app._drag_world_rect(600, 400, pad)
+    gx0, gy0, gw0, gh0 = app._drag_world_rect(LEFT, TOP, pad)
     check("快照盖得住面板并留出 pad 余量",
           (ww, wh) == (gw0, gh0) and ww >= W + pad * 2 and wh >= H + pad * 2,
           "%dx%d" % (ww, wh))
@@ -265,22 +298,38 @@ try:
           (wx, wy) == (gx0, gy0) and wx % app.BLUR_F == 0 and wy % app.BLUR_F == 0,
           "%dx%d @ (%d,%d)" % (ww, wh, wx, wy))
     check("窗口位置变了，快照尺寸也不许变（网格才不会错开）",
-          app._drag_world_rect(700, 500, pad)[2:] == (gw0, gh0),
-          "%s vs %s" % (app._drag_world_rect(700, 500, pad)[2:], (gw0, gh0)))
+          app._drag_world_rect(LEFT + 100, TOP + 100, pad)[2:] == (gw0, gh0),
+          "%s vs %s" % (app._drag_world_rect(LEFT + 100, TOP + 100, pad)[2:],
+                          (gw0, gh0)))
+
+    # 贴边是个关键分界：快照要被钳在屏内，而「钳」很容易顺手把网格对齐打掉
+    # —— 13×36=468、13×37=481，屏宽减 gw 一般落在两者之间，一 max/min 就把
+    # 起点挪到 478 那种非整倍数上，条纹相位跟着跳。所以贴边时也要对齐。
+    _nx, _ny, _nw, _nh = app._drag_world_rect(VW - W - 40, VH - H - 40, pad)
+    check("贴边但还留得住余量时，起点仍然对齐网格",
+          _nx % app.BLUR_F == 0 and _ny % app.BLUR_F == 0,
+          "(%d,%d) 网格 %d" % (_nx, _ny, app.BLUR_F))
+    check("贴边对齐之后仍然盖得住窗口",
+          _nx <= VW - W - 40 and _nx + _nw >= VW - 40
+          and _ny <= VH - H - 40 and _ny + _nh >= VH - 40,
+          "快照 x %d..%d / y %d..%d，窗口 %d..%d / %d..%d"
+          % (_nx, _nx + _nw, _ny, _ny + _nh,
+             VW - W - 40, VW - 40, VH - H - 40, VH - 40))
 
     n0 = calls["n"]
-    inside = app._grab_behind(600 + pad - 4, 400 + pad - 4)   # 仍在快照内
+    # 偏移取 pad 的一半：贴太近（pad-4）的话，快照一旦被钳位就顶到右边了
+    inside = app._grab_behind(LEFT + pad // 2, TOP + pad // 2)   # 仍在快照内
     check("快照范围内不再抓屏", calls["n"] == n0, "又抓了 %d 次" % (calls["n"] - n0))
     check("裁出来的大小对", inside is not None and len(inside) == W * H * 4)
 
-    out = app._grab_behind(600 + pad * 3, 400)                # 走出右边界
+    out = app._grab_behind(LEFT + pad * 2, TOP)                # 走出右边界
     check("走出快照 → 返回 None，交给调用方补抓", out is None, repr(out))
 
     # 补抓只服务当前这一帧，绝不许顶替后台维护的那张大图：一旦换了，覆盖从
     # pad 掉到 DRAG_PAD_SMALL，下一帧立刻又不够，会把补抓喂成连续补抓。
     keep = app.drag_world
     calls["n"] = 0
-    patched = app._grab_behind_now(600 + pad * 3, 400)
+    patched = app._grab_behind_now(LEFT + pad * 2, TOP)
     check("补抓能拿到画面（不靠后台那张图）",
           patched is not None and len(patched) == W * H * 4)
     check("补抓不顶替后台快照", app.drag_world is keep)
@@ -292,9 +341,9 @@ try:
     # 这是「拖动时条纹不抖」的根据 —— 模糊只对整块做过一次，降采样网格相对
     # 屏幕固定；而旧写法每帧裁完再模糊，网格跟着裁切点走，同一段壁纸每帧的
     # 条纹位置都在变（实测偏差 4.4~5.9/255，随偏移量以 BLUR_F 为周期摆动）。
-    a1 = app._grab_behind(600, 400)
-    a2 = app._grab_behind(608, 400)
     step = 8
+    a1 = app._grab_behind(LEFT, TOP)
+    a2 = app._grab_behind(LEFT + step, TOP)     # 同一快照内右移 8px
     tot = cnt = 0
     for y in range(4, H - 4, 4):
         base = y * W
@@ -439,19 +488,41 @@ check("10 个方向都是 13 倍数、面积±6%、盖得住窗口",
       not _bad, "；".join(_bad))
 check("缓拖（5px/帧）横向前方留了 200 以上",
       _front.get("5,0", 0) >= 200, "实际 %d" % _front.get("5,0", 0))
+# 前向余量的上限由屏幕决定，不是程序想留多少就留多少：窗口在 (400,400)，
+# 快照再宽也不能越过屏幕右边，所以「窗口右边到屏幕右边还剩多少」就是天花板。
+# 1024×768 的 CI 只有 284px，留不出设计的 320 —— 那不是缺陷，是屏幕小。
+_cap_x = VW - (400 + W)
+_cap_y = VH - (400 + H)
+_want_x = min(320, _cap_x)
+_want_y = min(240, _cap_y)
 check("快拖（80px/帧）横向前方留了 320 以上（原来只有 96）",
-      _front.get("80,0", 0) >= 320, "实际 %d" % _front.get("80,0", 0))
+      _front.get("80,0", 0) >= _want_x - _f,
+      "实际 %d（屏内上限 %d）" % (_front.get("80,0", 0), _cap_x))
 check("纵向快拖也拉长了（0,80）",
-      _front.get("0,80", 0) >= 240, "实际 %d" % _front.get("0,80", 0))
-check("前向随速度单调变长（5 → 40 → 80）",
-      _front["5,0"] < _front["40,0"] < _front["80,0"],
-      "%s" % [_front["5,0"], _front["40,0"], _front["80,0"]])
+      _front.get("0,80", 0) >= _want_y - _f,
+      "实际 %d（屏内上限 %d）" % (_front.get("0,80", 0), _cap_y))
+if _cap_x >= 320 + _f:
+    check("前向随速度单调变长（5 → 40 → 80）",
+          _front["5,0"] < _front["40,0"] < _front["80,0"],
+          "%s" % [_front["5,0"], _front["40,0"], _front["80,0"]])
+else:
+    # 屏幕装不下 320：40 和 80 都会顶到天花板，允许相等，但不许倒退
+    check("前向随速度单调不减（屏太小，40/80 顶到同一上限）",
+          _front["5,0"] < _front["40,0"] <= _front["80,0"],
+          "%s（屏内上限 %d）" % ([_front["5,0"], _front["40,0"], _front["80,0"]],
+                                _cap_x))
 # 静止时必须是老的对称余量：首帧补抓、以及贴边兜底都还按这个走
 check("静止时退回对称 96（和改动前一致）",
       app._drag_pads(0, 0) == (snap.DRAG_PAD, snap.DRAG_PAD, 0, 0),
       "%s" % (app._drag_pads(0, 0),))
 
 # ======================================================================
+# 屏幕伪装到此为止：第 10 节以后要真的搬窗口
+if _real_gsm is not None:
+    user32.GetSystemMetrics = _real_gsm
+    VW = user32.GetSystemMetrics(snap.SM_CXVIRTUALSCREEN)
+    VH = user32.GetSystemMetrics(snap.SM_CYVIRTUALSCREEN)
+
 print("\n=== 10. 控件探测线程必须是事件驱动，不能轮询 ===")
 # 这个线程从程序启动活到退出，但只有截图过程中才有请求。写成「睡 15ms 轮询」
 # 就是 64 次/秒的空转唤醒，永远不停 —— 静置时那点 CPU 几乎全是它，更要紧的是

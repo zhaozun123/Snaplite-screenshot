@@ -3333,9 +3333,32 @@ class App:
         gh = _tile(H + pady * 2 + leady + f, vh)
         gx = (left - padx - (leadx if back_x else 0)) // f * f
         gy = (top - pady - (leady if back_y else 0)) // f * f
-        # 贴边时覆盖优先：对不齐顶多多一次条纹变化，盖不住就直接露黑边了。
-        gx = max(vx, min(gx, vx + vw - gw))
-        gy = max(vy, min(gy, vy + vh - gh))
+
+        def _clamp(g, lo, hi, need):
+            """把起点钳进 [lo, hi]，并**尽量**保住网格对齐。
+
+            两件事要同时满足，冲突时覆盖优先：
+
+              · need —— 快照的右/下边界必须盖住窗口，盖不住就是露黑边；
+              · 对齐 —— 起点落在 f 的格线上，模糊条纹才不会随位置漂。
+
+            不能直接 max(lo, min(g, hi))：hi = 屏宽 - gw 一般不是 f 的倍数，
+            贴右边缘时 gx 会被压成 478（13×36=468、13×37=481），网格相对桌面
+            错开 10px，同一段壁纸的条纹位置就变了 —— 拖动时就是「水波」，正是
+            上面那一段讲的问题换了个入口回来。所以先把 hi 向下取到 f 的倍数。
+
+            但向下取整会让出最多 f-1 像素的覆盖：窗口贴着屏右边时，对齐后的
+            gx 恰好差 10px 盖不住窗口右边那一溜。这时退回不对齐 —— 露黑边比
+            条纹跳难看多了，也更容易被当成 bug。"""
+            floor = min(max(lo, need), hi)
+            hi_a = hi // f * f
+            if hi_a >= floor:
+                return max(floor, min(g, hi_a))
+            return max(floor, min(g, hi))
+
+        # 贴边时覆盖优先：盖不住就直接露黑边了。
+        gx = _clamp(gx, vx, vx + vw - gw, left + W - gw)
+        gy = _clamp(gy, vy, vy + vh - gh, top + H - gh)
         return gx, gy, gw, gh
 
     def _drag_pads(self, dx, dy):
